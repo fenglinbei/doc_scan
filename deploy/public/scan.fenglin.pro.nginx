@@ -1,0 +1,53 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name scan.fenglin.pro;
+
+    location ^~ /.well-known/acme-challenge/ {
+        auth_basic off;
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name scan.fenglin.pro;
+
+    client_max_body_size 16m;
+
+    ssl_certificate /etc/letsencrypt/live/scan.fenglin.pro/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/scan.fenglin.pro/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    auth_basic "Document Scan";
+    auth_basic_user_file /etc/nginx/.htpasswd-docscan;
+
+    location /api/scan {
+        limit_req zone=docscan_api burst=5 nodelay;
+        proxy_pass http://127.0.0.1:18080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:18080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+    }
+}
