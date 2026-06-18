@@ -18,6 +18,7 @@ class ArtifactUrls(BaseModel):
     rectified: str
     background: str
     illumination_corrected: str
+    detail_enhanced: str
     morphology_enhanced: str
     binary_fixed: str
     binary_otsu: str

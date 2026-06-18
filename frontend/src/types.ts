@@ -15,6 +15,7 @@ export type ArtifactKey =
   | "rectified"
   | "background"
   | "illumination_corrected"
+  | "detail_enhanced"
   | "morphology_enhanced"
   | "binary_fixed"
   | "binary_otsu"

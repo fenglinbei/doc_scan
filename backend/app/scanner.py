@@ -705,6 +705,7 @@ def enhance_and_binarize(rectified: np.ndarray, params: ScanParams) -> tuple[dic
     background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, illumination_kernel)
     background = np.maximum(background, 1).astype(np.uint8)
     illumination_corrected = cv2.divide(gray, background, scale=255)
+    detail_enhanced = enhance_detail_preserving(gray)
 
     top_hat = cv2.morphologyEx(illumination_corrected, cv2.MORPH_TOPHAT, illumination_kernel)
     black_hat = cv2.morphologyEx(illumination_corrected, cv2.MORPH_BLACKHAT, illumination_kernel)
@@ -727,19 +728,34 @@ def enhance_and_binarize(rectified: np.ndarray, params: ScanParams) -> tuple[dic
     metrics["otsu_threshold"] = round(float(otsu_threshold), 2)
     metrics["sauvola_window"] = params.sauvola_window
     metrics["sauvola_k"] = round(params.sauvola_k, 3)
+    metrics["final_output"] = "detail_enhanced"
 
     return (
         {
             "background": background,
             "illumination_corrected": illumination_corrected,
+            "detail_enhanced": detail_enhanced,
             "morphology_enhanced": morphology_enhanced,
             "binary_fixed": binary_fixed,
             "binary_otsu": binary_otsu,
             "binary_sauvola": binary_sauvola,
-            "final": binary_sauvola,
+            "final": detail_enhanced,
         },
         metrics,
     )
+
+
+def enhance_detail_preserving(gray: np.ndarray) -> np.ndarray:
+    low, high = np.percentile(gray, (0.5, 99.5))
+    if high - low < 8:
+        stretched = gray.copy()
+    else:
+        stretched = (gray.astype(np.float32) - float(low)) * (255.0 / float(high - low))
+        stretched = np.clip(stretched, 0, 255).astype(np.uint8)
+
+    blurred = cv2.GaussianBlur(stretched, (0, 0), sigmaX=0.8)
+    sharpened = cv2.addWeighted(stretched, 1.2, blurred, -0.2, 0)
+    return cv2.bilateralFilter(sharpened, d=3, sigmaColor=12, sigmaSpace=8)
 
 
 def cleanup_binary(binary: np.ndarray, kernel_size: int) -> np.ndarray:
