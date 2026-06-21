@@ -242,22 +242,33 @@ def bright_region_quad_proposals(gray: np.ndarray, image: np.ndarray | None) -> 
     _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     mask = cv2.bitwise_or(mask, cv2.bitwise_and(otsu, (low_saturation.astype(np.uint8) * 255)))
 
-    short_side = min(gray.shape[:2])
-    close_size = ensure_odd(int(short_side * 0.035), 17, 71)
-    open_size = ensure_odd(int(short_side * 0.008), 3, 17)
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (open_size, open_size))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     proposals: list[np.ndarray] = []
     image_area = float(gray.shape[0] * gray.shape[1])
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:16]:
-        if cv2.contourArea(contour) < image_area * 0.04:
-            continue
-        proposals.extend(quad_proposals_from_contour(contour))
+    for candidate_mask in bright_region_masks(mask):
+        contours, _ = cv2.findContours(candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:16]:
+            if cv2.contourArea(contour) < image_area * 0.04:
+                continue
+            proposals.extend(quad_proposals_from_contour(contour))
     return proposals
+
+
+def bright_region_masks(mask: np.ndarray) -> list[np.ndarray]:
+    short_side = min(mask.shape[:2])
+    open_size = ensure_odd(int(short_side * 0.006), 3, 13)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (open_size, open_size))
+    close_sizes = (
+        ensure_odd(int(short_side * 0.010), 5, 19),
+        ensure_odd(int(short_side * 0.018), 9, 31),
+        ensure_odd(int(short_side * 0.030), 15, 55),
+    )
+    masks: list[np.ndarray] = []
+    for close_size in close_sizes:
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_size, close_size))
+        candidate = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, open_kernel, iterations=1)
+        masks.append(candidate)
+    return masks
 
 
 def quad_proposals_from_contour(contour: np.ndarray) -> list[np.ndarray]:
@@ -508,6 +519,10 @@ def build_candidate(
         + 0.06 * margin_score
         + 0.04 * aspect_score
     )
+    if source == "bright-region" and area_ratio >= 0.35 and surface_score >= 0.72:
+        score += 0.08
+    if source == "hough-lines" and area_ratio < 0.42:
+        score -= 0.10
     return Candidate(
         corners=ordered,
         score=float(score),
@@ -762,7 +777,8 @@ def enhance_low_contrast_text(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray,
     relative_dark = dark_detail.astype(np.float32) * 255.0 / np.maximum(background.astype(np.float32), 1.0)
     relative_dark = cv2.GaussianBlur(np.clip(relative_dark, 0, 255).astype(np.uint8), (3, 3), 0)
     otsu_threshold, _ = cv2.threshold(relative_dark, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    text_threshold = float(np.clip(max(5.0, otsu_threshold * 0.55), 5.0, 34.0))
+    target_threshold = foreground_limited_threshold(relative_dark, max_foreground_ratio=0.12)
+    text_threshold = float(np.clip(max(6.0, otsu_threshold * 0.82, target_threshold), 6.0, 42.0))
     text_mask = relative_dark > text_threshold
     text_mask = filter_readable_text_mask(text_mask)
     binary_readable = np.where(text_mask, 0, 255).astype(np.uint8)
@@ -790,6 +806,14 @@ def percentile_stretch(image: np.ndarray, low_percentile: float, high_percentile
         return np.clip(image, 0, 255).astype(np.uint8)
     stretched = (image.astype(np.float32) - float(low)) * (255.0 / float(high - low))
     return np.clip(stretched, 0, 255).astype(np.uint8)
+
+
+def foreground_limited_threshold(relative_dark: np.ndarray, max_foreground_ratio: float) -> float:
+    positive = relative_dark[relative_dark > 0]
+    if positive.size < 32:
+        return 6.0
+    percentile = float(np.clip(100.0 * (1.0 - max_foreground_ratio), 70.0, 96.5))
+    return float(np.percentile(positive, percentile))
 
 
 def filter_readable_text_mask(mask: np.ndarray) -> np.ndarray:

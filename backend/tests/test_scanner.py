@@ -57,6 +57,19 @@ def test_process_image_detects_complex_whiteboard_scene() -> None:
     assert mean_error < 90
 
 
+def test_process_image_detects_projected_slide_content() -> None:
+    image, expected_corners = synthetic_projected_slide_scene()
+    result = process_image(image, ScanParams())
+    actual = order_points(np.array(result.corners, dtype=np.float32))
+    expected = order_points(expected_corners.astype(np.float32))
+    mean_error = float(np.mean(np.linalg.norm(actual - expected, axis=1)))
+
+    assert result.candidate_score > 0.7
+    assert result.metrics["candidate_source"] != "fallback"
+    assert mean_error < 100
+    assert 0.02 < result.metrics["readable_text_ratio"] < 0.16
+
+
 def test_process_image_falls_back_without_quad() -> None:
     image = np.full((320, 420, 3), 180, dtype=np.uint8)
     result = process_image(image, ScanParams())
@@ -115,3 +128,34 @@ def synthetic_whiteboard_scene() -> tuple[np.ndarray, np.ndarray]:
     shadow = np.linspace(0.78, 1.0, canvas.shape[1], dtype=np.float32)
     canvas = np.clip(canvas.astype(np.float32) * shadow[None, :, None], 0, 255).astype(np.uint8)
     return canvas, board.astype(np.float32)
+
+
+def synthetic_projected_slide_scene() -> tuple[np.ndarray, np.ndarray]:
+    canvas = np.zeros((900, 1280, 3), dtype=np.uint8)
+    canvas[:] = (54, 56, 55)
+
+    cv2.rectangle(canvas, (40, 125), (1240, 185), (202, 204, 202), -1)
+    cv2.rectangle(canvas, (60, 860), (1230, 895), (32, 32, 32), -1)
+
+    slide = np.array([[78, 220], [1200, 238], [1216, 815], [72, 852]], dtype=np.int32)
+    cv2.fillConvexPoly(canvas, slide, (217, 229, 220))
+    cv2.polylines(canvas, [slide], True, (42, 45, 45), 7, cv2.LINE_AA)
+
+    cv2.putText(canvas, "Subjective Question   10 pts", (115, 285), cv2.FONT_HERSHEY_SIMPLEX, 1.35, (105, 112, 110), 4, cv2.LINE_AA)
+    cv2.putText(canvas, "Read the paragraph and find mistakes.", (115, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (105, 112, 110), 3, cv2.LINE_AA)
+    y = 410
+    lines = [
+        "In our study, we aimed to explore artificial intelligence in smart education.",
+        "We collected data from three different online learning platforms.",
+        "Each platform has unique features and a user interface.",
+        "To analyze the data, we used a deep learning algorithm.",
+        "The training process took approximately two weeks.",
+        "Our study aims to fill this gap by providing detailed analysis.",
+    ]
+    for line in lines:
+        cv2.putText(canvas, line, (120, y), cv2.FONT_HERSHEY_SIMPLEX, 0.74, (92, 98, 96), 2, cv2.LINE_AA)
+        y += 58
+
+    gradient = np.linspace(0.9, 1.05, canvas.shape[1], dtype=np.float32)
+    canvas = np.clip(canvas.astype(np.float32) * gradient[None, :, None], 0, 255).astype(np.uint8)
+    return canvas, slide.astype(np.float32)
