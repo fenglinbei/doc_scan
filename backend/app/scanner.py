@@ -699,64 +699,119 @@ def four_point_warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
 
 def enhance_and_binarize(rectified: np.ndarray, params: ScanParams) -> tuple[dict[str, np.ndarray], dict[str, float | int | str]]:
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
-    illumination_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (params.illumination_kernel, params.illumination_kernel)
-    )
-    background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, illumination_kernel)
-    background = np.maximum(background, 1).astype(np.uint8)
-    illumination_corrected = cv2.divide(gray, background, scale=255)
-    detail_enhanced = enhance_detail_preserving(gray)
+    text_enhanced, binary_readable, background, illumination_corrected, text_metrics = enhance_low_contrast_text(gray)
+    morphology_enhanced = text_enhanced.copy()
 
-    top_hat = cv2.morphologyEx(illumination_corrected, cv2.MORPH_TOPHAT, illumination_kernel)
-    black_hat = cv2.morphologyEx(illumination_corrected, cv2.MORPH_BLACKHAT, illumination_kernel)
-    morphology_enhanced = cv2.subtract(illumination_corrected, black_hat)
-    morphology_enhanced = cv2.add(morphology_enhanced, top_hat)
-    morphology_enhanced = cv2.normalize(morphology_enhanced, None, 0, 255, cv2.NORM_MINMAX)
-
-    _, binary_fixed = cv2.threshold(morphology_enhanced, params.fixed_threshold, 255, cv2.THRESH_BINARY)
-    otsu_threshold, binary_otsu = cv2.threshold(morphology_enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    sauvola_threshold = threshold_sauvola(
-        morphology_enhanced, window_size=params.sauvola_window, k=params.sauvola_k
-    )
-    binary_sauvola = (morphology_enhanced > sauvola_threshold).astype(np.uint8) * 255
+    _, binary_fixed = cv2.threshold(text_enhanced, params.fixed_threshold, 255, cv2.THRESH_BINARY)
+    otsu_threshold, binary_otsu = cv2.threshold(text_enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    sauvola_threshold = threshold_sauvola(text_enhanced, window_size=params.sauvola_window, k=params.sauvola_k)
+    binary_sauvola = (text_enhanced > sauvola_threshold).astype(np.uint8) * 255
 
     binary_fixed = cleanup_binary(binary_fixed, params.cleanup_kernel)
     binary_otsu = cleanup_binary(binary_otsu, params.cleanup_kernel)
     binary_sauvola = cleanup_binary(binary_sauvola, params.cleanup_kernel)
 
-    metrics = compute_threshold_metrics(gray, illumination_corrected, morphology_enhanced, binary_sauvola)
+    metrics = compute_threshold_metrics(gray, illumination_corrected, text_enhanced, binary_readable)
+    metrics.update(text_metrics)
     metrics["otsu_threshold"] = round(float(otsu_threshold), 2)
     metrics["sauvola_window"] = params.sauvola_window
     metrics["sauvola_k"] = round(params.sauvola_k, 3)
-    metrics["final_output"] = "detail_enhanced"
+    metrics["final_output"] = "text_enhanced"
 
     return (
         {
             "background": background,
             "illumination_corrected": illumination_corrected,
-            "detail_enhanced": detail_enhanced,
+            "detail_enhanced": text_enhanced,
+            "text_enhanced": text_enhanced,
+            "binary_readable": binary_readable,
             "morphology_enhanced": morphology_enhanced,
             "binary_fixed": binary_fixed,
             "binary_otsu": binary_otsu,
             "binary_sauvola": binary_sauvola,
-            "final": detail_enhanced,
+            "final": text_enhanced,
         },
         metrics,
     )
 
 
-def enhance_detail_preserving(gray: np.ndarray) -> np.ndarray:
-    low, high = np.percentile(gray, (0.5, 99.5))
-    if high - low < 8:
-        stretched = gray.copy()
+def enhance_low_contrast_text(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float | int]]:
+    short_side = min(gray.shape[:2])
+    background_kernel = ensure_odd(int(short_side * 0.075), 41, 151)
+    background = cv2.GaussianBlur(gray, (background_kernel, background_kernel), 0)
+    background = np.maximum(background, 1).astype(np.uint8)
+
+    illumination_corrected = cv2.divide(gray, background, scale=235)
+    dark_detail = cv2.subtract(background, gray)
+    dark_detail = cv2.GaussianBlur(dark_detail, (3, 3), 0)
+
+    detail_high = float(np.percentile(dark_detail, 99.3))
+    if detail_high > 1.0:
+        detail_gain = float(np.clip(72.0 / detail_high, 1.35, 5.0))
+        text_boost = np.clip(dark_detail.astype(np.float32) * detail_gain, 0, 92)
     else:
-        stretched = (gray.astype(np.float32) - float(low)) * (255.0 / float(high - low))
-        stretched = np.clip(stretched, 0, 255).astype(np.uint8)
+        detail_gain = 0.0
+        text_boost = np.zeros_like(dark_detail, dtype=np.float32)
 
-    blurred = cv2.GaussianBlur(stretched, (0, 0), sigmaX=0.8)
-    sharpened = cv2.addWeighted(stretched, 1.2, blurred, -0.2, 0)
-    return cv2.bilateralFilter(sharpened, d=3, sigmaColor=12, sigmaSpace=8)
+    enhanced_float = illumination_corrected.astype(np.float32) - text_boost
+    text_enhanced = percentile_stretch(enhanced_float, 0.7, 99.8)
+    blur = cv2.GaussianBlur(text_enhanced, (0, 0), sigmaX=0.75)
+    text_enhanced = cv2.addWeighted(text_enhanced, 1.32, blur, -0.32, 0)
+    text_enhanced = cv2.bilateralFilter(text_enhanced, d=3, sigmaColor=10, sigmaSpace=8)
 
+    relative_dark = dark_detail.astype(np.float32) * 255.0 / np.maximum(background.astype(np.float32), 1.0)
+    relative_dark = cv2.GaussianBlur(np.clip(relative_dark, 0, 255).astype(np.uint8), (3, 3), 0)
+    otsu_threshold, _ = cv2.threshold(relative_dark, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    text_threshold = float(np.clip(max(5.0, otsu_threshold * 0.55), 5.0, 34.0))
+    text_mask = relative_dark > text_threshold
+    text_mask = filter_readable_text_mask(text_mask)
+    binary_readable = np.where(text_mask, 0, 255).astype(np.uint8)
+
+    text_ratio = float(np.count_nonzero(text_mask) / max(text_mask.size, 1))
+    component_count = count_readable_text_components(text_mask)
+    return (
+        text_enhanced,
+        binary_readable,
+        background,
+        illumination_corrected,
+        {
+            "text_detail_strength": round(detail_high, 2),
+            "text_detail_gain": round(detail_gain, 3),
+            "readable_text_threshold": round(text_threshold, 2),
+            "readable_text_ratio": round(text_ratio, 4),
+            "readable_text_components": int(component_count),
+        },
+    )
+
+
+def percentile_stretch(image: np.ndarray, low_percentile: float, high_percentile: float) -> np.ndarray:
+    low, high = np.percentile(image, (low_percentile, high_percentile))
+    if high - low < 8:
+        return np.clip(image, 0, 255).astype(np.uint8)
+    stretched = (image.astype(np.float32) - float(low)) * (255.0 / float(high - low))
+    return np.clip(stretched, 0, 255).astype(np.uint8)
+
+
+def filter_readable_text_mask(mask: np.ndarray) -> np.ndarray:
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    filtered = np.zeros_like(mask, dtype=np.uint8)
+    max_area = max(80, int(mask.size * 0.018))
+    for label in range(1, labels_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if 2 <= area <= max_area:
+            filtered[labels == label] = 1
+    return filtered.astype(bool)
+
+
+def count_readable_text_components(mask: np.ndarray) -> int:
+    labels_count, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    max_area = max(80, int(mask.size * 0.006))
+    count = 0
+    for label in range(1, labels_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if 2 <= area <= max_area:
+            count += 1
+    return count
 
 def cleanup_binary(binary: np.ndarray, kernel_size: int) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))

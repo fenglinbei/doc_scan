@@ -27,6 +27,8 @@ def test_process_image_generates_all_artifacts() -> None:
         "background",
         "illumination_corrected",
         "detail_enhanced",
+        "text_enhanced",
+        "binary_readable",
         "morphology_enhanced",
         "binary_fixed",
         "binary_otsu",
@@ -34,8 +36,10 @@ def test_process_image_generates_all_artifacts() -> None:
         "final",
     }
     assert set(result.artifacts.keys()) == expected
-    assert np.array_equal(result.artifacts["final"], result.artifacts["detail_enhanced"])
-    assert result.metrics["final_output"] == "detail_enhanced"
+    assert np.array_equal(result.artifacts["final"], result.artifacts["text_enhanced"])
+    assert np.array_equal(result.artifacts["detail_enhanced"], result.artifacts["text_enhanced"])
+    assert result.metrics["final_output"] == "text_enhanced"
+    assert result.metrics["readable_text_ratio"] > 0
     assert result.candidate_score > 0.35
     assert result.metrics["output_width"] > 100
     assert result.metrics["foreground_ratio"] > 0

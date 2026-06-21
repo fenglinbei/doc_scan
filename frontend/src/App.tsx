@@ -24,15 +24,16 @@ const RESULT_ITEMS: ResultItem[] = [
   { key: "corner_detection", label: "角点检测", description: "候选四边形与角点编号" },
   { key: "rectified", label: "透视矫正", description: "四点单应性变换后的正视图" },
   { key: "background", label: "背景估计", description: "大核闭运算得到的光照场" },
-  { key: "detail_enhanced", label: "保细节增强", description: "面向阅读和 OCR 的灰度增强结果" },
-  { key: "morphology_enhanced", label: "形态学增强", description: "顶帽/底帽增强后的灰度图" },
+  { key: "text_enhanced", label: "低对比增强", description: "统一增强文档与 PPT 的灰度文字细节" },
+  { key: "binary_readable", label: "可读二值化", description: "基于暗文字细节的黑白对照结果" },
+  { key: "morphology_enhanced", label: "增强灰度", description: "兼容保留的文字增强灰度图" },
   { key: "binary_fixed", label: "固定阈值", description: "全局固定阈值二值化" },
   { key: "binary_otsu", label: "Otsu", description: "自动全局阈值二值化" },
   { key: "binary_sauvola", label: "Sauvola", description: "局部自适应阈值二值化" },
-  { key: "final", label: "最终结果", description: "默认采用保细节增强结果" }
+  { key: "final", label: "最终结果", description: "默认采用低对比文字增强结果" }
 ];
 
-const PRIMARY_ARTIFACTS: ArtifactKey[] = ["corner_detection", "rectified", "detail_enhanced", "final"];
+const PRIMARY_ARTIFACTS: ArtifactKey[] = ["corner_detection", "rectified", "text_enhanced", "final"];
 const ALL_ARTIFACTS = RESULT_ITEMS.map((item) => item.key);
 const SECONDARY_ARTIFACTS = ALL_ARTIFACTS.filter((key) => !PRIMARY_ARTIFACTS.includes(key));
 const BUSY_PHASES: TaskPhase[] = ["preparing", "uploading", "processing", "receiving"];
@@ -44,7 +45,7 @@ const INITIAL_TASK: ScanTask = {
   artifactTotal: RESULT_ITEMS.length
 };
 
-const PROCESSING_MESSAGES = ["正在定位文档边界", "正在做透视矫正", "正在保留细节增强", "正在生成二值化对照"];
+const PROCESSING_MESSAGES = ["正在定位文档边界", "正在做透视矫正", "正在增强低对比文字", "正在生成可读二值化对照"];
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);

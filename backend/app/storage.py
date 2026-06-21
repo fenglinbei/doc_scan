@@ -17,6 +17,8 @@ ARTIFACT_ORDER = (
     "background",
     "illumination_corrected",
     "detail_enhanced",
+    "text_enhanced",
+    "binary_readable",
     "morphology_enhanced",
     "binary_fixed",
     "binary_otsu",

@@ -9,6 +9,8 @@ const METRIC_LABELS: Record<string, string> = {
   candidate_score: "候选分",
   candidate_source: "候选来源",
   final_output: "最终分支",
+  text_detail_strength: "文字细节",
+  readable_text_ratio: "可读前景",
   foreground_ratio: "前景比例",
   text_background_contrast: "文字对比",
   small_noise_components: "小噪点",

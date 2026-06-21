@@ -92,28 +92,30 @@ score =
 
 该方法假设文档近似平面。对于弯曲书页，单应性透视变换只能校正整体视角，无法消除页面局部弯曲。
 
-### 3.5 保细节增强与形态学增强
+### 3.5 v2.2 低对比文字增强
+
+v2.2 不再按纸张、白板或 PPT 拆默认分支，而是统一使用“平滑背景 + 较暗文字/线条”的假设，面向文档和 PPT 扫描的低对比文字增强。
 
 1. 对矫正图转灰度。
-2. 保细节分支直接基于矫正灰度图做轻量百分位拉伸、轻锐化和双边滤波，输出 `detail_enhanced`。该分支不做强二值化，也不做会吞掉细笔画的形态学开运算，面向白板、手写和 OCR 阅读。
-3. 形态学分支使用大核闭运算估计背景光照场，默认核大小 `45x45`。
-4. 用 `gray / background * 255` 做除法归一化，降低阴影影响。
-5. 对归一化图像执行：
-   - 顶帽变换，增强局部亮细节。
-   - 底帽变换，提取暗文字和阴影结构。
-6. 使用 `illumination_corrected - blackhat + tophat` 得到 `morphology_enhanced`。
+2. 使用大尺度 Gaussian blur 估计平滑背景，输出 `background`。
+3. 使用 `gray / background` 做亮度归一化，输出 `illumination_corrected`，降低纸张阴影、投影色偏和亮度渐变。
+4. 使用 `background - gray` 提取暗文字细节，并按百分位自适应放大低对比字迹。
+5. 将暗文字细节回注到归一化灰度图，再做温和百分位拉伸、轻锐化和双边滤波，输出 `text_enhanced`。
+6. 默认 `final` 指向 `text_enhanced`。兼容字段 `detail_enhanced` 与 `morphology_enhanced` 也指向同一套增强灰度图，避免旧前端或旧结果解析断裂。
 
-默认 `final` 指向 `detail_enhanced`，强二值化结果作为对照 artifact 保留。
+该流程不对默认结果做强二值化，也不做会吞掉细小英文、标点和抗锯齿边缘的形态学开运算。
 
-### 3.6 三种二值化对比
+### 3.6 可读二值化与阈值对照
 
-同一张形态学增强图上输出三种结果：
+v2.2 额外输出 `binary_readable` 作为黑白对照。它基于相对暗文字细节阈值和连通域面积过滤生成，不使用腐蚀/开运算清理细笔画。
+
+实验对照仍保留三种传统阈值结果：
 
 - 固定阈值：默认 `180`，用于展示简单全局阈值的局限。
 - Otsu：自动全局阈值，适合直方图接近双峰的图像。
 - Sauvola：局部自适应阈值，默认窗口 `35`、`k=0.2`。
 
-后处理统一采用小核开运算去除小噪声、小核闭运算连接断笔。由于输出是白底黑字，后处理先反相为黑字前景，再恢复为白底黑字。
+这些传统二值化结果只作为对照 artifact，不作为默认最终结果。
 
 ## 4. 后端接口设计
 
@@ -169,6 +171,8 @@ score =
     "background": "/api/results/{job_id}/background.png",
     "illumination_corrected": "/api/results/{job_id}/illumination_corrected.png",
     "detail_enhanced": "/api/results/{job_id}/detail_enhanced.png",
+    "text_enhanced": "/api/results/{job_id}/text_enhanced.png",
+    "binary_readable": "/api/results/{job_id}/binary_readable.png",
     "morphology_enhanced": "/api/results/{job_id}/morphology_enhanced.png",
     "binary_fixed": "/api/results/{job_id}/binary_fixed.png",
     "binary_otsu": "/api/results/{job_id}/binary_otsu.png",
@@ -196,7 +200,7 @@ docs/assets/mobile-ui-concept.png
 - 图片输入区：同时提供“拍照”和“从相册选择”两个入口，避免移动端只能调用相机。
 - 基础参数面板：Canny、形态学核大小、Sauvola 窗口/k 值、固定阈值。
 - 状态条：待选择、待处理、上传中、处理中、结果回传中、完成、失败，并显示当前阶段进度。
-- 中间结果网格：角点检测、透视矫正、保细节增强、形态学增强、固定阈值、Otsu、Sauvola、最终结果。
+- 中间结果网格：角点检测、透视矫正、低对比增强、可读二值化、固定阈值、Otsu、Sauvola、最终结果。
 - 大图预览：点击任意结果缩略图进入检查模式。
 
 桌面端使用双列布局，左侧上传和参数，右侧结果；移动端按单列纵向布局，底部操作区保持易触达。
@@ -232,7 +236,7 @@ docs/assets/mobile-ui-concept.png
 - 上传前按最长边限制压缩到约 `1600-2000px`，保留原始长宽比例；课程验证需要的是文档边界和文字可读性，不需要上传手机原始超大图。
 - 对拍照得到的 JPEG 使用 `canvas.toBlob("image/jpeg", 0.86)` 生成提交图，避免 8-12MB 原图直接上传。
 - 提交参数中记录压缩后的尺寸，后端 metrics 也返回输出尺寸，便于实验说明压缩对效果的影响。
-- 结果图先加载小尺寸预览或关键结果：`corner_detection`、`rectified`、`detail_enhanced`、`final` 优先，其余 artifact 延迟加载。
+- 结果图先加载小尺寸预览或关键结果：`corner_detection`、`rectified`、`text_enhanced`、`final` 优先，其余 artifact 延迟加载。
 - 大图只在用户点击预览时再拉取，避免一次性下载全部高分辨率 PNG。
 - 后端可补充缩略图 artifact，例如 `thumbnail_final.webp`，前端网格优先使用缩略图，检查模式再加载原 PNG。
 - 对重复点击处理的同一图片和同一参数，前端可用 `fileHash + paramsHash` 做本地结果缓存，避免重复上传和重复下载。
