@@ -11,7 +11,7 @@ from skimage.filters import threshold_sauvola
 
 DETECTION_MAX_DIM = 1000
 RECTIFIED_OUTPUT_MAX_DIM = 1800
-PROCESSING_PIPELINE_VERSION = "2.7"
+PROCESSING_PIPELINE_VERSION = "2.7.1"
 LOCAL_BINARIZATION_WINDOW = 35
 NIBLACK_K = -0.2
 WOLF_K = 0.5
@@ -155,7 +155,7 @@ def process_image(image: np.ndarray, params: ScanParams | None = None) -> ScanOu
     if candidates:
         best_candidate = max(candidates, key=lambda candidate: candidate.score)
         corners_detect = order_points(best_candidate.corners)
-        corners_detect, folded_corner_refinements = refine_folded_corners(corners_detect, detect_image)
+        corners_detect, folded_corner_refinements = refine_folded_corners(corners_detect, detect_image, connected_edges)
         candidate_score = float(best_candidate.score)
     else:
         warnings.append("未找到可靠四边形候选，已回退到整张图像边界。")
@@ -345,7 +345,9 @@ def estimate_paper_mask(image: np.ndarray | None) -> np.ndarray | None:
     return paper
 
 
-def refine_folded_corners(corners: np.ndarray, image: np.ndarray) -> tuple[np.ndarray, int]:
+def refine_folded_corners(
+    corners: np.ndarray, image: np.ndarray, edges: np.ndarray | None = None
+) -> tuple[np.ndarray, int]:
     ordered = order_points(corners)
     paper_mask = estimate_paper_mask(image)
     if paper_mask is None:
@@ -393,6 +395,7 @@ def refine_folded_corners(corners: np.ndarray, image: np.ndarray) -> tuple[np.nd
     min_shift = max(12.0, short_side * 0.05)
     max_shift = max(min_shift + 1.0, short_side * 0.22)
     refinements = 0
+    support_edges = edges if edges is not None else edges_for_corner_refinement(image)
 
     for index, point in enumerate(intersections):
         if point is None or not np.all(np.isfinite(point)):
@@ -403,6 +406,8 @@ def refine_folded_corners(corners: np.ndarray, image: np.ndarray) -> tuple[np.nd
         old_radius = float(np.linalg.norm(ordered[index] - center))
         new_radius = float(np.linalg.norm(point - center))
         if new_radius <= old_radius + min_shift * 0.25:
+            continue
+        if corner_has_strong_existing_edges(support_edges, ordered, index):
             continue
         refined[index] = point.astype(np.float32)
         refinements += 1
@@ -415,6 +420,35 @@ def refine_folded_corners(corners: np.ndarray, image: np.ndarray) -> tuple[np.nd
     if abs(cv2.contourArea(refined)) < abs(cv2.contourArea(ordered)) * 0.92:
         return ordered, 0
     return order_points(refined), refinements
+
+
+def edges_for_corner_refinement(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    return connect_document_edges(cv2.Canny(blurred, 50, 150))
+
+
+def corner_has_strong_existing_edges(edges: np.ndarray, corners: np.ndarray, index: int) -> bool:
+    dilated_edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)))
+    previous_score = near_corner_edge_support(dilated_edges, corners[index], corners[(index - 1) % 4])
+    next_score = near_corner_edge_support(dilated_edges, corners[index], corners[(index + 1) % 4])
+    return min(previous_score, next_score) >= 0.90
+
+
+def near_corner_edge_support(dilated_edges: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    length = float(np.linalg.norm(end - start))
+    if length <= 1:
+        return 0.0
+    samples = int(np.clip(length / 4.0, 36, 96))
+    weights = np.linspace(0.02, 0.22, samples, dtype=np.float32)
+    points = start[None, :] + (end - start)[None, :] * weights[:, None]
+    xs = np.round(points[:, 0]).astype(np.int32)
+    ys = np.round(points[:, 1]).astype(np.int32)
+    valid = (0 <= xs) & (xs < dilated_edges.shape[1]) & (0 <= ys) & (ys < dilated_edges.shape[0])
+    if not np.any(valid):
+        return 0.0
+    hits = dilated_edges[ys[valid], xs[valid]] > 0
+    return float(np.count_nonzero(hits) / np.count_nonzero(valid))
 
 
 def largest_paper_component_near_quad(paper_mask: np.ndarray, corners: np.ndarray) -> np.ndarray | None:
