@@ -50,7 +50,7 @@ const INITIAL_TASK: ScanTask = {
   artifactTotal: RESULT_ITEMS.length
 };
 
-const PROCESSING_MESSAGES = ["正在定位文档边界", "正在做折角修正与透视矫正", "正在增强低对比文字", "正在生成 v2.6 融合二值化"];
+const PROCESSING_MESSAGES = ["正在定位文档边界", "正在做折角修正与透视矫正", "正在增强低对比文字", "正在生成 v2.7 融合二值化"];
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);

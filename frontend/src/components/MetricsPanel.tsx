@@ -16,7 +16,11 @@ const METRIC_LABELS: Record<string, string> = {
   small_noise_components: "小噪点",
   otsu_threshold: "Otsu 阈值",
   output_width: "输出宽",
-  output_height: "输出高"
+  output_height: "输出高",
+  time_total_ms: "CV 耗时",
+  time_process_call_ms: "处理调用",
+  time_save_artifacts_ms: "保存耗时",
+  time_api_total_ms: "接口总耗时"
 };
 
 export function MetricsPanel({ result }: Props) {

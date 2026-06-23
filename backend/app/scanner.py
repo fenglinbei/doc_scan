@@ -11,7 +11,7 @@ from skimage.filters import threshold_sauvola
 
 DETECTION_MAX_DIM = 1000
 RECTIFIED_OUTPUT_MAX_DIM = 1800
-PROCESSING_PIPELINE_VERSION = "2.6"
+PROCESSING_PIPELINE_VERSION = "2.7"
 LOCAL_BINARIZATION_WINDOW = 35
 NIBLACK_K = -0.2
 WOLF_K = 0.5
@@ -254,13 +254,13 @@ def find_quad_candidates(edges: np.ndarray, gray: np.ndarray, image: np.ndarray 
     paper_mask = estimate_paper_mask(image)
     candidates: list[Candidate] = []
 
-    for corners in contour_quad_proposals(edges):
+    for corners in deduplicate_quad_proposals(contour_quad_proposals(edges)):
         append_candidate(candidates, corners, edges, gray, image_area, "contour", paper_mask)
 
-    for corners in bright_region_quad_proposals(gray, image):
+    for corners in deduplicate_quad_proposals(bright_region_quad_proposals(gray, image)):
         append_candidate(candidates, corners, edges, gray, image_area, "bright-region", paper_mask)
 
-    for corners in hough_quad_proposals(edges):
+    for corners in deduplicate_quad_proposals(hough_quad_proposals(edges)):
         append_candidate(candidates, corners, edges, gray, image_area, "hough-lines", paper_mask)
 
     return deduplicate_candidates(candidates)
@@ -735,7 +735,8 @@ def build_candidate(
     margin_score = margin_score_for_quad(ordered, width, height)
     aspect_score = aspect_score_for_quad(ordered)
     paper_boundary_score = paper_boundary_score_for_quad(paper_mask, ordered, gray.shape)
-    area_score = min(area_ratio / 0.68, 1.0)
+    area_score = min(area_ratio / 0.42, 1.0)
+    border_touches = image_border_touch_count(ordered, width, height)
 
     score = (
         0.18 * area_score
@@ -753,6 +754,17 @@ def build_candidate(
     if source == "bright-region" and paper_boundary_score < 0.72:
         score -= 0.07
     if source == "hough-lines" and area_ratio < 0.42:
+        if side_score >= 0.55 and paper_boundary_score >= 0.65:
+            score -= 0.03
+        else:
+            score -= 0.10
+    if border_touches >= 2 and area_ratio >= 0.45 and side_score < 0.45:
+        score -= 0.12 + 0.05 * float(border_touches - 2)
+    if border_touches >= 3 and area_ratio >= 0.58 and edge_score < 0.45:
+        score -= 0.10
+    if border_touches >= 2 and side_score < 0.20 and edge_score < 0.25:
+        score -= 0.14
+    elif border_touches >= 3 and side_score < 0.25:
         score -= 0.10
     return Candidate(
         corners=ordered,
@@ -796,6 +808,16 @@ def deduplicate_candidates(candidates: list[Candidate]) -> list[Candidate]:
         if any(mean_corner_distance(candidate.corners, existing.corners) < 10.0 for existing in unique):
             continue
         unique.append(candidate)
+    return unique
+
+
+def deduplicate_quad_proposals(proposals: list[np.ndarray], distance_threshold: float = 5.0) -> list[np.ndarray]:
+    unique: list[np.ndarray] = []
+    for corners in proposals:
+        ordered = order_points(np.asarray(corners, dtype=np.float32))
+        if any(mean_corner_distance(ordered, existing) < distance_threshold for existing in unique):
+            continue
+        unique.append(ordered)
     return unique
 
 
@@ -879,23 +901,16 @@ def side_coverage_score(edges: np.ndarray, corners: np.ndarray) -> float:
 
 
 def contrast_score_for_quad(gray: np.ndarray, corners: np.ndarray) -> float:
-    mask = np.zeros_like(gray, dtype=np.uint8)
-    cv2.fillPoly(mask, [corners.astype(np.int32)], 255)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
-    inner = cv2.erode(mask, kernel, iterations=1) > 0
-    outer_band = np.logical_and(cv2.dilate(mask, kernel, iterations=2) > 0, mask == 0)
-    if np.count_nonzero(inner) < 100 or np.count_nonzero(outer_band) < 100:
+    inner_values = sample_quad_grid_values(gray, corners, grid_size=18, shrink=0.78)
+    outer_values = sample_outer_band_values(gray, corners)
+    if inner_values.size < 80 or outer_values.size < 40:
         return 0.0
-    delta = abs(float(np.mean(gray[inner])) - float(np.mean(gray[outer_band])))
+    delta = abs(float(np.mean(inner_values)) - float(np.mean(outer_values)))
     return float(np.clip(delta / 80.0, 0.0, 1.0))
 
 
 def surface_score_for_quad(gray: np.ndarray, corners: np.ndarray) -> float:
-    center = np.mean(corners, axis=0)
-    inner_corners = center + (corners - center) * 0.72
-    mask = np.zeros_like(gray, dtype=np.uint8)
-    cv2.fillPoly(mask, [inner_corners.astype(np.int32)], 255)
-    pixels = gray[mask > 0]
+    pixels = sample_quad_grid_values(gray, corners, grid_size=24, shrink=0.72)
     if pixels.size < 100:
         return 0.0
     median = float(np.median(pixels))
@@ -913,6 +928,16 @@ def margin_score_for_quad(corners: np.ndarray, width: int, height: int) -> float
         float(height - 1 - np.max(corners[:, 1])),
     )
     return float(np.clip(min_margin / max(1.0, min(width, height) * 0.035), 0.0, 1.0))
+
+
+def image_border_touch_count(corners: np.ndarray, width: int, height: int) -> int:
+    tolerance = max(2.0, min(width, height) * 0.006)
+    return (
+        int(float(np.min(corners[:, 0])) <= tolerance)
+        + int(float(np.max(corners[:, 0])) >= width - 1 - tolerance)
+        + int(float(np.min(corners[:, 1])) <= tolerance)
+        + int(float(np.max(corners[:, 1])) >= height - 1 - tolerance)
+    )
 
 
 def aspect_score_for_quad(corners: np.ndarray) -> float:
@@ -933,28 +958,105 @@ def paper_boundary_score_for_quad(
     if paper_mask is None:
         return 0.75
     height, width = shape[:2]
-    pts = clamp_corners(order_points(corners), width, height).astype(np.int32)
-    polygon_mask = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(polygon_mask, [pts], 1)
-    if cv2.countNonZero(polygon_mask) < 100:
+    pts = clamp_corners(order_points(corners), width, height).astype(np.float32)
+    if abs(cv2.contourArea(pts)) < 100:
         return 0.0
 
-    band_width = ensure_odd(int(min(height, width) * 0.018), 11, 25)
-    erode_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (band_width, band_width))
-    eroded = cv2.erode(polygon_mask, erode_kernel, iterations=1)
-    border = np.logical_and(polygon_mask > 0, eroded == 0)
-    border_ratio = float(np.mean(paper_mask[border])) if np.any(border) else 0.0
-
+    center = np.mean(pts, axis=0)
+    band_width = float(np.clip(min(height, width) * 0.018, 8.0, 24.0))
     side_ratios: list[float] = []
+    border_samples: list[np.ndarray] = []
     for index in range(4):
-        side_mask = np.zeros((height, width), dtype=np.uint8)
-        cv2.line(side_mask, tuple(pts[index]), tuple(pts[(index + 1) % 4]), 1, band_width)
-        side_pixels = side_mask > 0
-        side_ratios.append(float(np.mean(paper_mask[side_pixels])) if np.any(side_pixels) else 0.0)
+        start = pts[index]
+        end = pts[(index + 1) % 4]
+        side = end - start
+        length = float(np.linalg.norm(side))
+        if length <= 1:
+            continue
 
+        sample_count = int(np.clip(length / 3.0, 32, 240))
+        weights = np.linspace(0.04, 0.96, sample_count, dtype=np.float32)
+        base_points = start[None, :] + side[None, :] * weights[:, None]
+
+        normal = np.array([-side[1], side[0]], dtype=np.float32) / length
+        midpoint = (start + end) * 0.5
+        if float(np.dot(normal, center - midpoint)) < 0:
+            normal = -normal
+
+        side_samples: list[np.ndarray] = []
+        for offset in (0.0, band_width * 0.45, band_width * 0.9):
+            values = sample_mask_at_points(paper_mask, base_points + normal[None, :] * offset)
+            if values.size:
+                side_samples.append(values)
+                border_samples.append(values)
+        if side_samples:
+            side_ratios.append(float(np.mean(np.concatenate(side_samples))))
+
+    if not side_ratios or not border_samples:
+        return 0.0
+    border_ratio = float(np.mean(np.concatenate(border_samples)))
     side_mean = float(np.mean(side_ratios)) if side_ratios else 0.0
     side_floor = float(min(side_ratios)) if side_ratios else 0.0
     return float(np.clip(0.55 * border_ratio + 0.25 * side_mean + 0.20 * side_floor, 0.0, 1.0))
+
+
+def sample_mask_at_points(mask: np.ndarray, points: np.ndarray) -> np.ndarray:
+    return sample_array_at_points(mask, points)
+
+
+def sample_array_at_points(image: np.ndarray, points: np.ndarray) -> np.ndarray:
+    xs = np.round(points[:, 0]).astype(np.int32)
+    ys = np.round(points[:, 1]).astype(np.int32)
+    valid = (0 <= xs) & (xs < image.shape[1]) & (0 <= ys) & (ys < image.shape[0])
+    if not np.any(valid):
+        return np.array([], dtype=np.float32)
+    return image[ys[valid], xs[valid]].astype(np.float32)
+
+
+def sample_quad_grid_values(
+    image: np.ndarray, corners: np.ndarray, grid_size: int = 20, shrink: float = 1.0
+) -> np.ndarray:
+    ordered = order_points(corners.astype(np.float32))
+    if shrink < 1.0:
+        center = np.mean(ordered, axis=0)
+        ordered = center + (ordered - center) * float(shrink)
+    tl, tr, br, bl = ordered
+    weights = np.linspace(0.08, 0.92, grid_size, dtype=np.float32)
+    uu, vv = np.meshgrid(weights, weights)
+    top = tl[None, None, :] + (tr - tl)[None, None, :] * uu[:, :, None]
+    bottom = bl[None, None, :] + (br - bl)[None, None, :] * uu[:, :, None]
+    points = top + (bottom - top) * vv[:, :, None]
+    return sample_array_at_points(image, points.reshape(-1, 2))
+
+
+def sample_outer_band_values(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    height, width = gray.shape[:2]
+    pts = clamp_corners(order_points(corners), width, height).astype(np.float32)
+    center = np.mean(pts, axis=0)
+    band_width = float(np.clip(min(height, width) * 0.02, 8.0, 24.0))
+    samples: list[np.ndarray] = []
+    for index in range(4):
+        start = pts[index]
+        end = pts[(index + 1) % 4]
+        side = end - start
+        length = float(np.linalg.norm(side))
+        if length <= 1:
+            continue
+        sample_count = int(np.clip(length / 4.0, 24, 180))
+        weights = np.linspace(0.08, 0.92, sample_count, dtype=np.float32)
+        base_points = start[None, :] + side[None, :] * weights[:, None]
+        inward = np.array([-side[1], side[0]], dtype=np.float32) / length
+        midpoint = (start + end) * 0.5
+        if float(np.dot(inward, center - midpoint)) < 0:
+            inward = -inward
+        outward = -inward
+        for offset in (band_width * 0.9, band_width * 1.8):
+            values = sample_array_at_points(gray, base_points + outward[None, :] * offset)
+            if values.size:
+                samples.append(values)
+    if not samples:
+        return np.array([], dtype=np.float32)
+    return np.concatenate(samples)
 
 
 def four_point_warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
@@ -1217,14 +1319,36 @@ def to_foreground_mask(binary: np.ndarray) -> np.ndarray:
 
 
 def keep_components_touching_seed(candidate: np.ndarray, seed: np.ndarray, min_area: int) -> np.ndarray:
-    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(candidate.astype(np.uint8), 8)
-    kept = np.zeros_like(candidate, dtype=bool)
+    constrained = candidate.astype(bool)
+    grown = np.logical_and(seed, constrained).astype(np.uint8)
+    if not np.any(grown):
+        return np.zeros_like(constrained, dtype=bool)
+
+    candidate_u8 = constrained.astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    max_iterations = int(np.clip(min(candidate.shape[:2]) * 0.02, 3, 24))
+    for _ in range(max_iterations):
+        previous_count = int(grown.sum())
+        grown = cv2.bitwise_and(cv2.dilate(grown, kernel, iterations=1), candidate_u8)
+        if int(grown.sum()) == previous_count:
+            break
+
+    if min_area <= 1:
+        return grown.astype(bool)
+    if min_area <= 2:
+        neighbor_count = cv2.filter2D(
+            grown,
+            cv2.CV_16U,
+            np.ones((3, 3), dtype=np.uint8),
+            borderType=cv2.BORDER_CONSTANT,
+        )
+        return np.logical_and(grown > 0, neighbor_count >= min_area)
+
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(grown, 8)
+    kept = np.zeros_like(constrained, dtype=bool)
     for label in range(1, labels_count):
-        component = labels == label
-        if int(stats[label, cv2.CC_STAT_AREA]) < min_area:
-            continue
-        if np.any(np.logical_and(component, seed)):
-            kept[component] = True
+        if int(stats[label, cv2.CC_STAT_AREA]) >= min_area:
+            kept[labels == label] = True
     return kept
 
 

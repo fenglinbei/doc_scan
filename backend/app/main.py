@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,10 +31,13 @@ def health() -> dict[str, str]:
 
 @app.post("/api/scan", response_model=ScanResultModel)
 async def scan_document(file: UploadFile = File(...), params: str | None = Form(default=None)) -> ScanResultModel:
+    api_start = time.perf_counter()
     if file.content_type and not file.content_type.startswith("image/"):
         raise HTTPException(status_code=415, detail="Only image uploads are supported.")
 
+    read_start = time.perf_counter()
     image_bytes = await file.read()
+    upload_read_ms = int(round((time.perf_counter() - read_start) * 1000))
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Uploaded image is empty.")
     if len(image_bytes) > MAX_UPLOAD_BYTES:
@@ -41,15 +45,28 @@ async def scan_document(file: UploadFile = File(...), params: str | None = Form(
 
     parsed_params = parse_params(params)
     try:
+        process_start = time.perf_counter()
         output = process_image_bytes(image_bytes, ScanParams.from_mapping(parsed_params.model_dump()))
+        process_call_ms = int(round((time.perf_counter() - process_start) * 1000))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - keeps user-facing API stable on unexpected CV errors.
         raise HTTPException(status_code=500, detail=f"Image processing failed: {exc}") from exc
 
+    save_start = time.perf_counter()
     job_id, job_dir = create_job_dir()
     saved = save_artifacts(job_dir, output.artifacts)
+    save_artifacts_ms = int(round((time.perf_counter() - save_start) * 1000))
     urls = {name: f"/api/results/{job_id}/{filename}" for name, filename in saved.items()}
+    output.metrics.update(
+        {
+            "upload_bytes": len(image_bytes),
+            "time_upload_read_ms": upload_read_ms,
+            "time_process_call_ms": process_call_ms,
+            "time_save_artifacts_ms": save_artifacts_ms,
+            "time_api_total_ms": int(round((time.perf_counter() - api_start) * 1000)),
+        }
+    )
 
     return ScanResultModel(
         job_id=job_id,

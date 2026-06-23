@@ -131,7 +131,7 @@ Recommended headline metrics for MIDV:
 
 ## 5. Secondary method diagnostics
 
-The script uses the same backend `process_image` output as the API. This means MIDV geometry metrics, rectified images, and binarization diagnostics all come from the v2.6 backend processing line, including folded-corner refinement.
+The script uses the same backend `process_image` output as the API. This means MIDV geometry metrics, rectified images, and binarization diagnostics all come from the v2.7 backend processing line, including folded-corner refinement.
 
 - `binary_fixed`
 - `binary_otsu`
@@ -196,22 +196,21 @@ python3 experiments/evaluate_midv.py \
   --datasets midv500 \
   --frames-per-video 1 \
   --skip-artifacts \
-  --out runtime/experiments/midv_eval_available_fpv1
+  --out runtime/experiments/midv_eval_v27_available_fpv1
 ```
 
-Scope: the currently downloaded 3 document types, 10 condition/device videos each, first frame per video, 30 frames total.
+Scope: the currently downloaded 3 document types, 10 condition/device videos each, first frame per video, 30 frames total. Current numbers are from the v2.7 detector/scoring path.
 
 Overall:
 
 | Cases | Mean IoU | Median IoU | Mean corner error | IoU >= 0.90 | Corner <= 2% diag | Fallback rate |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 30 | 0.6786 | 0.9337 | 258.91 px | 56.67% | 56.67% | 0.00% |
+| 30 | 0.6773 | 0.9328 | 244.92 px | 53.33% | 53.33% | 0.00% |
 
 Condition-level read:
 
-- Strong: `KA`, `TA`, `TS`, `HA` are near or above 0.95 mean IoU in this small run.
-- Mixed: `CA`, `KS`, `HS` have failures in at least one document type.
-- Weak: `PA` and `PS` are the hardest. This is expected because MIDV partial frames can have corners outside the visible image.
-- `CS` is also weak in this sample because clutter can produce large competing quadrangles.
+- Strong: `KS`, `TS`, `TA`, `HA`, and `KA` are stable in this small run.
+- Mixed: `CA`, `CS`, `HS`, and `PA` still have document-type-specific failures, but v2.7 reduces several large-background false positives in clutter/partial scenes.
+- Weak: `PS` remains the hardest because MIDV partial frames can have little visible target area and corners outside the image; the current candidate generators often do not propose the true document boundary there.
 
 Treat these numbers as a smoke baseline, not a publishable result. Increase `--frames-per-video`, add the remaining MIDV-500 document zips, and run without `--skip-artifacts` for selected failure cases when tuning the detector.

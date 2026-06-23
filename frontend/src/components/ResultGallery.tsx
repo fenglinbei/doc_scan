@@ -78,7 +78,7 @@ export function ResultGallery({ result, artifactStatuses, items, onRetry, onSele
         <div className="empty-results">
           <div className="empty-line" />
           <div className="empty-line short" />
-          <p>上传图片后，这里会展示角点检测、折角修正、低对比增强、v2.6 融合二值化和对照结果。</p>
+          <p>上传图片后，这里会展示角点检测、折角修正、低对比增强、v2.7 融合二值化和对照结果。</p>
         </div>
       )}
     </section>
