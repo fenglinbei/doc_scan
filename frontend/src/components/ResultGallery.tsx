@@ -30,7 +30,10 @@ export function ResultGallery({ result, artifactStatuses, items, onRetry, onSele
             const isError = artifact?.status === "error";
 
             return (
-              <article className={`result-card ${item.key === "final" ? "featured-result" : ""}`} key={item.key}>
+              <article
+                className={`result-card ${item.key === "final" || item.key === "binary_wolf_fused" ? "featured-result" : ""}`}
+                key={item.key}
+              >
                 <button type="button" className="image-button" disabled={!isDone} onClick={() => onSelect(item)}>
                   {imageUrl ? (
                     <img src={imageUrl} alt={item.label} />
@@ -75,7 +78,7 @@ export function ResultGallery({ result, artifactStatuses, items, onRetry, onSele
         <div className="empty-results">
           <div className="empty-line" />
           <div className="empty-line short" />
-          <p>上传图片后，这里会展示角点检测、形态学增强和三种二值化结果。</p>
+          <p>上传图片后，这里会展示角点检测、低对比增强、v2.5 融合二值化和对照结果。</p>
         </div>
       )}
     </section>

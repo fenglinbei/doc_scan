@@ -20,6 +20,7 @@ def test_scan_pipeline_storage_and_result_response(tmp_path, monkeypatch) -> Non
     job_id, job_dir = create_job_dir()
     saved = save_artifacts(job_dir, output.artifacts)
     assert saved["final"] == "final.png"
+    assert saved["binary_wolf_fused"] == "binary_wolf_fused.png"
     assert output.candidate_score > 0.35
 
     final_response = get_result(job_id, "final.png")

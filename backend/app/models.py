@@ -25,6 +25,11 @@ class ArtifactUrls(BaseModel):
     binary_fixed: str
     binary_otsu: str
     binary_sauvola: str
+    binary_niblack: str
+    binary_wolf: str
+    binary_nick: str
+    binary_bradley: str
+    binary_wolf_fused: str
     final: str
 
 

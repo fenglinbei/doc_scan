@@ -30,10 +30,15 @@ const RESULT_ITEMS: ResultItem[] = [
   { key: "binary_fixed", label: "固定阈值", description: "全局固定阈值二值化" },
   { key: "binary_otsu", label: "Otsu", description: "自动全局阈值二值化" },
   { key: "binary_sauvola", label: "Sauvola", description: "局部自适应阈值二值化" },
+  { key: "binary_niblack", label: "Niblack", description: "局部均值与方差阈值二值化" },
+  { key: "binary_wolf", label: "Wolf", description: "Wolf-Jolion 局部阈值二值化" },
+  { key: "binary_nick", label: "NICK", description: "NICK 局部阈值二值化" },
+  { key: "binary_bradley", label: "Bradley", description: "局部均值比例阈值二值化" },
+  { key: "binary_wolf_fused", label: "Ours (binary_wolf_fuse)", description: "Wolf/NICK 强种子与低对比弱笔画融合" },
   { key: "final", label: "最终结果", description: "默认采用低对比文字增强结果" }
 ];
 
-const PRIMARY_ARTIFACTS: ArtifactKey[] = ["corner_detection", "rectified", "text_enhanced", "final"];
+const PRIMARY_ARTIFACTS: ArtifactKey[] = ["corner_detection", "rectified", "text_enhanced", "binary_wolf_fused", "final"];
 const ALL_ARTIFACTS = RESULT_ITEMS.map((item) => item.key);
 const SECONDARY_ARTIFACTS = ALL_ARTIFACTS.filter((key) => !PRIMARY_ARTIFACTS.includes(key));
 const BUSY_PHASES: TaskPhase[] = ["preparing", "uploading", "processing", "receiving"];
@@ -45,7 +50,7 @@ const INITIAL_TASK: ScanTask = {
   artifactTotal: RESULT_ITEMS.length
 };
 
-const PROCESSING_MESSAGES = ["正在定位文档边界", "正在做透视矫正", "正在增强低对比文字", "正在生成可读二值化对照"];
+const PROCESSING_MESSAGES = ["正在定位文档边界", "正在做透视矫正", "正在增强低对比文字", "正在生成 v2.5 融合二值化"];
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);

@@ -8,6 +8,7 @@
 backend/   FastAPI API, OpenCV/scikit-image scanning pipeline, tests
 frontend/  React + Vite + TypeScript mobile-first verification UI
 docs/      Project design document and UI concept image
+experiments/  Reproducible dataset evaluation scripts
 ```
 
 ## Backend
@@ -45,6 +46,26 @@ pytest
 cd frontend
 npm run build
 ```
+
+## DIBCO/H-DIBCO Evaluation
+
+Downloaded datasets are expected under `data/raw/`, which is intentionally ignored by Git. Run the objective binarization benchmark with:
+
+```bash
+python3 experiments/evaluate_dibco.py --out runtime/experiments/dibco_eval_v1
+```
+
+The script writes per-image artifacts, contact sheets, and CSV summaries under `runtime/experiments/`. See `docs/dibco_hdibco_evaluation.md` for the dataset layout, metrics, and current baseline results.
+
+## MIDV Evaluation
+
+MIDV uses mobile-captured frames with document-boundary quadrangle ground truth, so it evaluates corner detection and perspective robustness rather than DIBCO-style pixel binarization accuracy.
+
+```bash
+python3 experiments/evaluate_midv.py --datasets midv500 --frames-per-video 1 --out runtime/experiments/midv_eval_available_fpv1
+```
+
+See `docs/midv_evaluation.md` for the MIDV data status, metrics, commands, and current lightweight baseline.
 
 ## Constraints
 

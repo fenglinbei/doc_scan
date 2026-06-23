@@ -8,6 +8,18 @@ import numpy as np
 from skimage.filters import threshold_sauvola
 
 
+LOCAL_BINARIZATION_WINDOW = 35
+NIBLACK_K = -0.2
+WOLF_K = 0.5
+NICK_K = -0.2
+BRADLEY_T = 0.15
+WOLF_FUSED_WEAK_SCALE = 1.05
+WOLF_FUSED_STRONG_SCALE = 1.25
+WOLF_FUSED_WEAK_PERCENTILE = 75.0
+WOLF_FUSED_STRONG_PERCENTILE = 90.0
+WOLF_FUSED_MIN_AREA = 2
+
+
 @dataclass(frozen=True)
 class ScanParams:
     canny_low: int = 50
@@ -717,6 +729,16 @@ def enhance_and_binarize(rectified: np.ndarray, params: ScanParams) -> tuple[dic
     text_enhanced, binary_readable, background, illumination_corrected, text_metrics = enhance_low_contrast_text(gray)
     morphology_enhanced = text_enhanced.copy()
 
+    local_binaries = compute_local_binarization_artifacts(gray)
+    binary_wolf_fused = compute_wolf_fused_binary(
+        gray,
+        background,
+        local_binaries["binary_wolf"],
+        local_binaries["binary_nick"],
+        binary_readable,
+        text_metrics,
+    )
+
     _, binary_fixed = cv2.threshold(text_enhanced, params.fixed_threshold, 255, cv2.THRESH_BINARY)
     otsu_threshold, binary_otsu = cv2.threshold(text_enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     sauvola_threshold = threshold_sauvola(text_enhanced, window_size=params.sauvola_window, k=params.sauvola_k)
@@ -744,6 +766,8 @@ def enhance_and_binarize(rectified: np.ndarray, params: ScanParams) -> tuple[dic
             "binary_fixed": binary_fixed,
             "binary_otsu": binary_otsu,
             "binary_sauvola": binary_sauvola,
+            **local_binaries,
+            "binary_wolf_fused": binary_wolf_fused,
             "final": text_enhanced,
         },
         metrics,
@@ -836,6 +860,126 @@ def count_readable_text_components(mask: np.ndarray) -> int:
         if 2 <= area <= max_area:
             count += 1
     return count
+
+
+def compute_local_binarization_artifacts(gray: np.ndarray) -> dict[str, np.ndarray]:
+    window = ensure_odd(LOCAL_BINARIZATION_WINDOW, 3, 151)
+    mean, std, mean_square = local_statistics(gray, window)
+    return {
+        "binary_niblack": threshold_dark_foreground(gray, niblack_threshold(mean, std, NIBLACK_K)),
+        "binary_wolf": threshold_dark_foreground(gray, wolf_threshold(gray, mean, std, WOLF_K)),
+        "binary_nick": threshold_dark_foreground(gray, nick_threshold(mean, mean_square, NICK_K)),
+        "binary_bradley": threshold_dark_foreground(gray, bradley_threshold(mean, BRADLEY_T)),
+    }
+
+
+def local_statistics(image: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    image_float = image.astype(np.float32)
+    mean = cv2.boxFilter(
+        image_float,
+        ddepth=-1,
+        ksize=(window, window),
+        normalize=True,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    mean_square = cv2.boxFilter(
+        image_float * image_float,
+        ddepth=-1,
+        ksize=(window, window),
+        normalize=True,
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    variance = np.maximum(mean_square - mean * mean, 0.0)
+    return mean, np.sqrt(variance), mean_square
+
+
+def niblack_threshold(mean: np.ndarray, std: np.ndarray, k: float) -> np.ndarray:
+    return mean + k * std
+
+
+def wolf_threshold(image: np.ndarray, mean: np.ndarray, std: np.ndarray, k: float) -> np.ndarray:
+    min_gray = float(np.min(image))
+    max_std = max(float(np.max(std)), 1.0)
+    return mean + k * ((std / max_std) - 1.0) * (mean - min_gray)
+
+
+def nick_threshold(mean: np.ndarray, mean_square: np.ndarray, k: float) -> np.ndarray:
+    return mean + k * np.sqrt(np.maximum(mean_square, 0.0))
+
+
+def bradley_threshold(mean: np.ndarray, t: float) -> np.ndarray:
+    return mean * (1.0 - t)
+
+
+def threshold_dark_foreground(image: np.ndarray, threshold: np.ndarray) -> np.ndarray:
+    return np.where(image.astype(np.float32) > threshold, 255, 0).astype(np.uint8)
+
+
+def compute_wolf_fused_binary(
+    gray: np.ndarray,
+    background: np.ndarray,
+    binary_wolf: np.ndarray,
+    binary_nick: np.ndarray,
+    binary_readable: np.ndarray,
+    text_metrics: dict[str, float | int],
+) -> np.ndarray:
+    if background.shape != gray.shape:
+        background = cv2.resize(background, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_AREA)
+
+    relative_dark = relative_dark_detail(gray, background)
+    wolf_mask = to_foreground_mask(binary_wolf)
+    nick_mask = to_foreground_mask(binary_nick)
+    readable_mask = to_foreground_mask(binary_readable)
+    candidate_source = np.logical_or(nick_mask, readable_mask)
+
+    source_values = relative_dark[candidate_source]
+    weak_percentile = float(np.clip(WOLF_FUSED_WEAK_PERCENTILE, 0.0, 100.0))
+    strong_percentile = float(np.clip(WOLF_FUSED_STRONG_PERCENTILE, weak_percentile, 100.0))
+    weak_floor = float(np.percentile(source_values, weak_percentile)) if source_values.size else 6.0
+    strong_floor = float(np.percentile(source_values, strong_percentile)) if source_values.size else weak_floor
+    base_threshold = safe_float(text_metrics.get("readable_text_threshold"), weak_floor)
+    weak_threshold = max(base_threshold * WOLF_FUSED_WEAK_SCALE, weak_floor)
+    strong_threshold = max(base_threshold * WOLF_FUSED_STRONG_SCALE, strong_floor, weak_threshold)
+
+    strong_seed = np.logical_or(wolf_mask, np.logical_and(candidate_source, relative_dark >= strong_threshold))
+    weak_candidate = np.logical_and(candidate_source, relative_dark >= weak_threshold)
+    candidate = np.logical_or(wolf_mask, weak_candidate)
+    fused = keep_components_touching_seed(candidate, strong_seed, WOLF_FUSED_MIN_AREA)
+    return np.where(fused, 0, 255).astype(np.uint8)
+
+
+def relative_dark_detail(gray: np.ndarray, background: np.ndarray) -> np.ndarray:
+    dark_detail = cv2.subtract(background, gray)
+    relative_dark = dark_detail.astype(np.float32) * 255.0 / np.maximum(background.astype(np.float32), 1.0)
+    relative_dark = cv2.GaussianBlur(np.clip(relative_dark, 0, 255).astype(np.uint8), (3, 3), 0)
+    return relative_dark.astype(np.float32)
+
+
+def to_foreground_mask(binary: np.ndarray) -> np.ndarray:
+    return binary < 128
+
+
+def keep_components_touching_seed(candidate: np.ndarray, seed: np.ndarray, min_area: int) -> np.ndarray:
+    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(candidate.astype(np.uint8), 8)
+    kept = np.zeros_like(candidate, dtype=bool)
+    for label in range(1, labels_count):
+        component = labels == label
+        if int(stats[label, cv2.CC_STAT_AREA]) < min_area:
+            continue
+        if np.any(np.logical_and(component, seed)):
+            kept[component] = True
+    return kept
+
+
+def safe_float(value: object, fallback: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not np.isfinite(result):
+        return fallback
+    return result
+
 
 def cleanup_binary(binary: np.ndarray, kernel_size: int) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))

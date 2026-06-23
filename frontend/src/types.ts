@@ -22,6 +22,11 @@ export type ArtifactKey =
   | "binary_fixed"
   | "binary_otsu"
   | "binary_sauvola"
+  | "binary_niblack"
+  | "binary_wolf"
+  | "binary_nick"
+  | "binary_bradley"
+  | "binary_wolf_fused"
   | "final";
 
 export type ScanResult = {

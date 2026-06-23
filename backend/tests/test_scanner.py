@@ -33,11 +33,17 @@ def test_process_image_generates_all_artifacts() -> None:
         "binary_fixed",
         "binary_otsu",
         "binary_sauvola",
+        "binary_niblack",
+        "binary_wolf",
+        "binary_nick",
+        "binary_bradley",
+        "binary_wolf_fused",
         "final",
     }
     assert set(result.artifacts.keys()) == expected
     assert np.array_equal(result.artifacts["final"], result.artifacts["text_enhanced"])
     assert np.array_equal(result.artifacts["detail_enhanced"], result.artifacts["text_enhanced"])
+    assert set(np.unique(result.artifacts["binary_wolf_fused"])).issubset({0, 255})
     assert result.metrics["final_output"] == "text_enhanced"
     assert result.metrics["readable_text_ratio"] > 0
     assert result.candidate_score > 0.35

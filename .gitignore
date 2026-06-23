@@ -1,4 +1,5 @@
 backend/.venv/
+__pycache__/
 backend/__pycache__/
 backend/app/__pycache__/
 backend/tests/__pycache__/
@@ -10,6 +11,7 @@ frontend/dist/
 frontend/.vite/
 frontend/tsconfig.tsbuildinfo
 .playwright-cli/
+data/
 runtime/
 
 *.pyc
