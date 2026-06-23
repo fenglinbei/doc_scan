@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from app.scanner import ScanParams, ensure_odd, order_points, process_image
+from app.scanner import BINARIZATION_METHOD_KEYS, PROCESSING_PIPELINE_VERSION, ScanParams, ensure_odd, order_points, process_image
 
 
 def test_ensure_odd_bounds() -> None:
@@ -41,9 +41,11 @@ def test_process_image_generates_all_artifacts() -> None:
         "final",
     }
     assert set(result.artifacts.keys()) == expected
+    assert set(BINARIZATION_METHOD_KEYS).issubset(result.artifacts)
     assert np.array_equal(result.artifacts["final"], result.artifacts["text_enhanced"])
     assert np.array_equal(result.artifacts["detail_enhanced"], result.artifacts["text_enhanced"])
     assert set(np.unique(result.artifacts["binary_wolf_fused"])).issubset({0, 255})
+    assert result.metrics["pipeline_version"] == PROCESSING_PIPELINE_VERSION
     assert result.metrics["final_output"] == "text_enhanced"
     assert result.metrics["readable_text_ratio"] > 0
     assert result.candidate_score > 0.35

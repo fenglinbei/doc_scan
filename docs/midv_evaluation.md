@@ -131,7 +131,7 @@ Recommended headline metrics for MIDV:
 
 ## 5. Secondary method diagnostics
 
-The script also reuses the latest binarization variants from `experiments/evaluate_dibco.py` on each detected rectified document:
+The script uses the same backend `process_image` output as the API. This means MIDV geometry metrics, rectified images, and binarization diagnostics all come from the v2.6 backend processing line, including folded-corner refinement.
 
 - `binary_fixed`
 - `binary_otsu`
@@ -141,10 +141,7 @@ The script also reuses the latest binarization variants from `experiments/evalua
 - `binary_wolf_fused`
 - `binary_nick`
 - `binary_bradley`
-- `binary_gatos_like`
-- `binary_majority`
 - `binary_readable`
-- `binary_readable_refined`
 
 Because MIDV does not provide pixel-level binary GT, these rows are diagnostics rather than accuracy scores. Use them to compare stability across real mobile captures:
 
@@ -180,9 +177,11 @@ runtime/experiments/midv_eval_.../
       rectified.png
       text_enhanced.png
       binary_readable.png
-      binary_readable_refined.png
+      binary_fixed.png
+      binary_otsu.png
+      binary_sauvola.png
+      binary_wolf.png
       binary_wolf_fused.png
-      binary_majority.png
       contact_sheet.png
 ```
 

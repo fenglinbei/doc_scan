@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any
 
 import cv2
@@ -8,6 +9,9 @@ import numpy as np
 from skimage.filters import threshold_sauvola
 
 
+DETECTION_MAX_DIM = 1000
+RECTIFIED_OUTPUT_MAX_DIM = 1800
+PROCESSING_PIPELINE_VERSION = "2.6"
 LOCAL_BINARIZATION_WINDOW = 35
 NIBLACK_K = -0.2
 WOLF_K = 0.5
@@ -18,6 +22,17 @@ WOLF_FUSED_STRONG_SCALE = 1.25
 WOLF_FUSED_WEAK_PERCENTILE = 75.0
 WOLF_FUSED_STRONG_PERCENTILE = 90.0
 WOLF_FUSED_MIN_AREA = 2
+BINARIZATION_METHOD_KEYS = (
+    "binary_fixed",
+    "binary_otsu",
+    "binary_sauvola",
+    "binary_niblack",
+    "binary_wolf",
+    "binary_wolf_fused",
+    "binary_nick",
+    "binary_bradley",
+    "binary_readable",
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +88,7 @@ class Candidate:
     surface_score: float
     margin_score: float
     aspect_score: float
+    paper_boundary_score: float
 
 
 @dataclass
@@ -116,30 +132,50 @@ def process_image_bytes(image_bytes: bytes, params: ScanParams | None = None) ->
 def process_image(image: np.ndarray, params: ScanParams | None = None) -> ScanOutput:
     params = (params or ScanParams()).normalized()
     warnings: list[str] = []
+    timings: dict[str, float] = {}
+    stage_start = time.perf_counter()
     original = image.copy()
+    timings["copy_input"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     detect_image, resize_ratio = resize_for_detection(original)
     gray = cv2.cvtColor(detect_image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, params.canny_low, params.canny_high)
-    connected_edges = connect_document_edges(edges)
+    timings["prepare_edges"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
+    connected_edges = connect_document_edges(edges)
+    timings["connect_edges"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     candidates = find_quad_candidates(connected_edges, gray, detect_image)
+    timings["find_candidates"] = time.perf_counter() - stage_start
     best_candidate: Candidate | None = None
     if candidates:
         best_candidate = max(candidates, key=lambda candidate: candidate.score)
         corners_detect = order_points(best_candidate.corners)
+        corners_detect, folded_corner_refinements = refine_folded_corners(corners_detect, detect_image)
         candidate_score = float(best_candidate.score)
     else:
         warnings.append("未找到可靠四边形候选，已回退到整张图像边界。")
         h, w = detect_image.shape[:2]
         corners_detect = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+        folded_corner_refinements = 0
         candidate_score = 0.0
 
     original_corners = corners_detect / resize_ratio
     original_corners = clamp_corners(original_corners, original.shape[1], original.shape[0])
+    stage_start = time.perf_counter()
     rectified = four_point_warp(original, original_corners)
-    artifacts, threshold_metrics = enhance_and_binarize(rectified, params)
+    rectified, rectified_scale = resize_for_output(rectified)
+    timings["warp_and_resize"] = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
+    artifacts, threshold_metrics = process_rectified_document(rectified, params)
+    timings["enhance_and_binarize"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     corner_overlay = draw_corner_overlay(original, original_corners, candidate_score)
     artifacts = {
         "original": original,
@@ -148,14 +184,23 @@ def process_image(image: np.ndarray, params: ScanParams | None = None) -> ScanOu
         "rectified": rectified,
         **artifacts,
     }
+    timings["assemble_artifacts"] = time.perf_counter() - stage_start
 
     metrics = {
+        "pipeline_version": PROCESSING_PIPELINE_VERSION,
         "candidate_count": len(candidates),
         "candidate_score": round(candidate_score, 4),
         "candidate_source": best_candidate.source if best_candidate else "fallback",
+        "candidate_paper_boundary_score": round(best_candidate.paper_boundary_score, 4) if best_candidate else 0.0,
+        "folded_corner_refinements": folded_corner_refinements,
+        "detection_width": int(detect_image.shape[1]),
+        "detection_height": int(detect_image.shape[0]),
+        "rectified_scale": round(rectified_scale, 4),
         "output_width": int(rectified.shape[1]),
         "output_height": int(rectified.shape[0]),
         **threshold_metrics,
+        **{f"time_{name}_ms": int(round(value * 1000)) for name, value in timings.items()},
+        "time_total_ms": int(round(sum(timings.values()) * 1000)),
     }
 
     if candidate_score and candidate_score < 0.45:
@@ -170,13 +215,23 @@ def process_image(image: np.ndarray, params: ScanParams | None = None) -> ScanOu
     )
 
 
-def resize_for_detection(image: np.ndarray, max_dim: int = 1400) -> tuple[np.ndarray, float]:
+def resize_for_detection(image: np.ndarray, max_dim: int = DETECTION_MAX_DIM) -> tuple[np.ndarray, float]:
     h, w = image.shape[:2]
     largest = max(h, w)
     if largest <= max_dim:
         return image.copy(), 1.0
     ratio = max_dim / float(largest)
     resized = cv2.resize(image, (int(w * ratio), int(h * ratio)), interpolation=cv2.INTER_AREA)
+    return resized, ratio
+
+
+def resize_for_output(image: np.ndarray, max_dim: int = RECTIFIED_OUTPUT_MAX_DIM) -> tuple[np.ndarray, float]:
+    h, w = image.shape[:2]
+    largest = max(h, w)
+    if largest <= max_dim:
+        return image, 1.0
+    ratio = max_dim / float(largest)
+    resized = cv2.resize(image, (int(round(w * ratio)), int(round(h * ratio))), interpolation=cv2.INTER_AREA)
     return resized, ratio
 
 
@@ -196,16 +251,17 @@ def connect_document_edges(edges: np.ndarray) -> np.ndarray:
 
 def find_quad_candidates(edges: np.ndarray, gray: np.ndarray, image: np.ndarray | None = None) -> list[Candidate]:
     image_area = float(edges.shape[0] * edges.shape[1])
+    paper_mask = estimate_paper_mask(image)
     candidates: list[Candidate] = []
 
     for corners in contour_quad_proposals(edges):
-        append_candidate(candidates, corners, edges, gray, image_area, "contour")
+        append_candidate(candidates, corners, edges, gray, image_area, "contour", paper_mask)
 
     for corners in bright_region_quad_proposals(gray, image):
-        append_candidate(candidates, corners, edges, gray, image_area, "bright-region")
+        append_candidate(candidates, corners, edges, gray, image_area, "bright-region", paper_mask)
 
     for corners in hough_quad_proposals(edges):
-        append_candidate(candidates, corners, edges, gray, image_area, "hough-lines")
+        append_candidate(candidates, corners, edges, gray, image_area, "hough-lines", paper_mask)
 
     return deduplicate_candidates(candidates)
 
@@ -217,8 +273,9 @@ def append_candidate(
     gray: np.ndarray,
     image_area: float,
     source: str,
+    paper_mask: np.ndarray | None,
 ) -> None:
-    candidate = build_candidate(corners, edges, gray, image_area, source)
+    candidate = build_candidate(corners, edges, gray, image_area, source, paper_mask)
     if candidate is not None:
         candidates.append(candidate)
 
@@ -227,7 +284,7 @@ def contour_quad_proposals(edges: np.ndarray) -> list[np.ndarray]:
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     image_area = float(edges.shape[0] * edges.shape[1])
     proposals: list[np.ndarray] = []
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:64]:
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:48]:
         if cv2.contourArea(contour) < image_area * 0.015:
             continue
         proposals.extend(quad_proposals_from_contour(contour))
@@ -258,11 +315,168 @@ def bright_region_quad_proposals(gray: np.ndarray, image: np.ndarray | None) -> 
     image_area = float(gray.shape[0] * gray.shape[1])
     for candidate_mask in bright_region_masks(mask):
         contours, _ = cv2.findContours(candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:16]:
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
             if cv2.contourArea(contour) < image_area * 0.04:
                 continue
             proposals.extend(quad_proposals_from_contour(contour))
     return proposals
+
+
+def estimate_paper_mask(image: np.ndarray | None) -> np.ndarray | None:
+    if image is None:
+        return None
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    lightness = lab[:, :, 0]
+
+    saturation_threshold = int(np.clip(np.percentile(saturation, 55), 38, 70))
+    value_threshold = int(max(120, min(165, np.percentile(value, 58))))
+    lightness_threshold = int(max(135, min(175, np.percentile(lightness, 58))))
+    paper = np.logical_and.reduce(
+        (
+            saturation <= saturation_threshold,
+            value >= value_threshold,
+            lightness >= lightness_threshold,
+        )
+    ).astype(np.uint8)
+    paper = cv2.morphologyEx(paper, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    return paper
+
+
+def refine_folded_corners(corners: np.ndarray, image: np.ndarray) -> tuple[np.ndarray, int]:
+    ordered = order_points(corners)
+    paper_mask = estimate_paper_mask(image)
+    if paper_mask is None:
+        return ordered, 0
+
+    contour = largest_paper_component_near_quad(paper_mask, ordered)
+    if contour is None:
+        return ordered, 0
+
+    contour_points = contour.reshape(-1, 2).astype(np.float32)
+    if len(contour_points) < 80:
+        return ordered, 0
+
+    width_estimate = max(float(np.linalg.norm(ordered[1] - ordered[0])), float(np.linalg.norm(ordered[2] - ordered[3])))
+    height_estimate = max(float(np.linalg.norm(ordered[3] - ordered[0])), float(np.linalg.norm(ordered[2] - ordered[1])))
+    if width_estimate < 1 or height_estimate < 1:
+        return ordered, 0
+
+    destination = np.array(
+        [[0, 0], [width_estimate, 0], [width_estimate, height_estimate], [0, height_estimate]],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(ordered.astype(np.float32), destination)
+    normalized = normalize_quad_points(contour_points, matrix, width_estimate, height_estimate)
+    if normalized is None:
+        return ordered, 0
+    u, v = normalized[:, 0], normalized[:, 1]
+
+    lines = {
+        "top": fit_line_from_points(contour_points[(v > -0.12) & (v < 0.08) & (u > 0.20) & (u < 0.96)]),
+        "right": fit_line_from_points(contour_points[(u > 0.92) & (u < 1.10) & (v > 0.10) & (v < 0.92)]),
+        "bottom": fit_line_from_points(contour_points[(v > 0.92) & (v < 1.10) & (u > 0.08) & (u < 0.92)]),
+        "left": fit_line_from_points(contour_points[(u > -0.12) & (u < 0.08) & (v > 0.20) & (v < 0.96)]),
+    }
+    intersections = [
+        intersect_fitted_lines(lines["top"], lines["left"]),
+        intersect_fitted_lines(lines["top"], lines["right"]),
+        intersect_fitted_lines(lines["bottom"], lines["right"]),
+        intersect_fitted_lines(lines["bottom"], lines["left"]),
+    ]
+
+    refined = ordered.copy()
+    center = np.mean(ordered, axis=0)
+    short_side = min(width_estimate, height_estimate)
+    min_shift = max(12.0, short_side * 0.05)
+    max_shift = max(min_shift + 1.0, short_side * 0.22)
+    refinements = 0
+
+    for index, point in enumerate(intersections):
+        if point is None or not np.all(np.isfinite(point)):
+            continue
+        shift = float(np.linalg.norm(point - ordered[index]))
+        if shift < min_shift or shift > max_shift:
+            continue
+        old_radius = float(np.linalg.norm(ordered[index] - center))
+        new_radius = float(np.linalg.norm(point - center))
+        if new_radius <= old_radius + min_shift * 0.25:
+            continue
+        refined[index] = point.astype(np.float32)
+        refinements += 1
+
+    if refinements == 0:
+        return ordered, 0
+    refined = clamp_corners(refined, image.shape[1], image.shape[0])
+    if not cv2.isContourConvex(refined.astype(np.float32)):
+        return ordered, 0
+    if abs(cv2.contourArea(refined)) < abs(cv2.contourArea(ordered)) * 0.92:
+        return ordered, 0
+    return order_points(refined), refinements
+
+
+def largest_paper_component_near_quad(paper_mask: np.ndarray, corners: np.ndarray) -> np.ndarray | None:
+    height, width = paper_mask.shape[:2]
+    center = np.mean(corners, axis=0)
+    expanded = center + (corners - center) * 1.14
+    roi = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(roi, [clamp_corners(expanded, width, height).astype(np.int32)], 255)
+    masked = cv2.bitwise_and((paper_mask * 255).astype(np.uint8), roi)
+    masked = cv2.morphologyEx(masked, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)))
+    contours, _ = cv2.findContours(masked, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    min_area = max(300.0, abs(cv2.contourArea(corners.astype(np.float32))) * 0.18)
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < min_area:
+        return None
+    return contour
+
+
+def normalize_quad_points(
+    points: np.ndarray, matrix: np.ndarray, width: float, height: float
+) -> np.ndarray | None:
+    homogeneous = np.hstack([points.astype(np.float32), np.ones((len(points), 1), dtype=np.float32)])
+    projected = (matrix @ homogeneous.T).T
+    denominator = projected[:, 2:3]
+    valid = np.abs(denominator[:, 0]) > 1e-6
+    if np.count_nonzero(valid) < 32:
+        return None
+    safe_denominator = denominator.copy()
+    safe_denominator[~valid] = np.nan
+    uv = projected[:, :2] / safe_denominator
+    normalized = np.column_stack((uv[:, 0] / max(width, 1.0), uv[:, 1] / max(height, 1.0))).astype(np.float32)
+    return normalized
+
+
+def fit_line_from_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    if len(points) < 24:
+        return None
+    vx, vy, x0, y0 = cv2.fitLine(points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(4)
+    direction = np.array([float(vx), float(vy)], dtype=np.float32)
+    point = np.array([float(x0), float(y0)], dtype=np.float32)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-6:
+        return None
+    return direction / norm, point
+
+
+def intersect_fitted_lines(
+    first: tuple[np.ndarray, np.ndarray] | None,
+    second: tuple[np.ndarray, np.ndarray] | None,
+) -> np.ndarray | None:
+    if first is None or second is None:
+        return None
+    first_direction, first_point = first
+    second_direction, second_point = second
+    cross = float(first_direction[0] * second_direction[1] - first_direction[1] * second_direction[0])
+    if abs(cross) < 1e-5:
+        return None
+    delta = second_point - first_point
+    t = float(delta[0] * second_direction[1] - delta[1] * second_direction[0]) / cross
+    return first_point + t * first_direction
 
 
 def bright_region_masks(mask: np.ndarray) -> list[np.ndarray]:
@@ -451,7 +665,7 @@ def line_position_at_center(kind: str, direction: np.ndarray, point: np.ndarray,
     return float(point[0] + direction[0] * t)
 
 
-def select_line_groups(groups: list[LineGroup], minimum: float, maximum: float, limit: int = 7) -> list[LineGroup]:
+def select_line_groups(groups: list[LineGroup], minimum: float, maximum: float, limit: int = 4) -> list[LineGroup]:
     selected = [group for group in groups if minimum <= group.position <= maximum]
     return selected[:limit]
 
@@ -492,6 +706,7 @@ def build_candidate(
     gray: np.ndarray,
     image_area: float,
     source: str,
+    paper_mask: np.ndarray | None = None,
 ) -> Candidate | None:
     height, width = edges.shape[:2]
     corners = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
@@ -519,20 +734,24 @@ def build_candidate(
     surface_score = surface_score_for_quad(gray, ordered)
     margin_score = margin_score_for_quad(ordered, width, height)
     aspect_score = aspect_score_for_quad(ordered)
+    paper_boundary_score = paper_boundary_score_for_quad(paper_mask, ordered, gray.shape)
     area_score = min(area_ratio / 0.68, 1.0)
 
     score = (
-        0.22 * area_score
+        0.18 * area_score
         + 0.16 * angle_score
-        + 0.12 * edge_score
-        + 0.22 * side_score
-        + 0.10 * contrast_score
-        + 0.08 * surface_score
+        + 0.08 * edge_score * paper_boundary_score
+        + 0.16 * side_score * paper_boundary_score
+        + 0.08 * contrast_score
+        + 0.06 * surface_score
         + 0.06 * margin_score
         + 0.04 * aspect_score
+        + 0.18 * paper_boundary_score
     )
-    if source == "bright-region" and area_ratio >= 0.35 and surface_score >= 0.72:
-        score += 0.08
+    if source == "bright-region" and area_ratio >= 0.35 and surface_score >= 0.72 and paper_boundary_score >= 0.84:
+        score += 0.04
+    if source == "bright-region" and paper_boundary_score < 0.72:
+        score -= 0.07
     if source == "hough-lines" and area_ratio < 0.42:
         score -= 0.10
     return Candidate(
@@ -547,6 +766,7 @@ def build_candidate(
         surface_score=float(surface_score),
         margin_score=float(margin_score),
         aspect_score=float(aspect_score),
+        paper_boundary_score=float(paper_boundary_score),
     )
 
 
@@ -707,6 +927,36 @@ def aspect_score_for_quad(corners: np.ndarray) -> float:
     return float(np.clip(1.0 - (ratio - 3.0) / 3.0, 0.35, 1.0))
 
 
+def paper_boundary_score_for_quad(
+    paper_mask: np.ndarray | None, corners: np.ndarray, shape: tuple[int, ...]
+) -> float:
+    if paper_mask is None:
+        return 0.75
+    height, width = shape[:2]
+    pts = clamp_corners(order_points(corners), width, height).astype(np.int32)
+    polygon_mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(polygon_mask, [pts], 1)
+    if cv2.countNonZero(polygon_mask) < 100:
+        return 0.0
+
+    band_width = ensure_odd(int(min(height, width) * 0.018), 11, 25)
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (band_width, band_width))
+    eroded = cv2.erode(polygon_mask, erode_kernel, iterations=1)
+    border = np.logical_and(polygon_mask > 0, eroded == 0)
+    border_ratio = float(np.mean(paper_mask[border])) if np.any(border) else 0.0
+
+    side_ratios: list[float] = []
+    for index in range(4):
+        side_mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.line(side_mask, tuple(pts[index]), tuple(pts[(index + 1) % 4]), 1, band_width)
+        side_pixels = side_mask > 0
+        side_ratios.append(float(np.mean(paper_mask[side_pixels])) if np.any(side_pixels) else 0.0)
+
+    side_mean = float(np.mean(side_ratios)) if side_ratios else 0.0
+    side_floor = float(min(side_ratios)) if side_ratios else 0.0
+    return float(np.clip(0.55 * border_ratio + 0.25 * side_mean + 0.20 * side_floor, 0.0, 1.0))
+
+
 def four_point_warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
     rect = order_points(corners)
     tl, tr, br, bl = rect
@@ -721,10 +971,13 @@ def four_point_warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
         dtype=np.float32,
     )
     matrix = cv2.getPerspectiveTransform(rect.astype(np.float32), destination)
-    return cv2.warpPerspective(image, matrix, (max_width, max_height), flags=cv2.INTER_CUBIC)
+    return cv2.warpPerspective(image, matrix, (max_width, max_height), flags=cv2.INTER_LINEAR)
 
 
-def enhance_and_binarize(rectified: np.ndarray, params: ScanParams) -> tuple[dict[str, np.ndarray], dict[str, float | int | str]]:
+def process_rectified_document(
+    rectified: np.ndarray, params: ScanParams | None = None
+) -> tuple[dict[str, np.ndarray], dict[str, float | int | str]]:
+    params = (params or ScanParams()).normalized()
     gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     text_enhanced, binary_readable, background, illumination_corrected, text_metrics = enhance_low_contrast_text(gray)
     morphology_enhanced = text_enhanced.copy()
@@ -772,6 +1025,10 @@ def enhance_and_binarize(rectified: np.ndarray, params: ScanParams) -> tuple[dic
         },
         metrics,
     )
+
+
+def enhance_and_binarize(rectified: np.ndarray, params: ScanParams) -> tuple[dict[str, np.ndarray], dict[str, float | int | str]]:
+    return process_rectified_document(rectified, params)
 
 
 def enhance_low_contrast_text(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float | int]]:

@@ -7,7 +7,6 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 import numpy as np
@@ -18,23 +17,16 @@ BACKEND_ROOT = REPO_ROOT / "backend"
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.scanner import ScanParams, enhance_and_binarize  # noqa: E402
-
-
-METHOD_KEYS = (
-    "binary_fixed",
-    "binary_otsu",
-    "binary_sauvola",
-    "binary_niblack",
-    "binary_wolf",
-    "binary_wolf_fused",
-    "binary_nick",
-    "binary_bradley",
-    "binary_gatos_like",
-    "binary_majority",
-    "binary_readable",
-    "binary_readable_refined",
+from app.scanner import (  # noqa: E402
+    BINARIZATION_METHOD_KEYS,
+    PROCESSING_PIPELINE_VERSION,
+    ScanParams,
+    process_rectified_document,
+    resize_for_output,
 )
+
+
+METHOD_KEYS = BINARIZATION_METHOD_KEYS
 DISPLAY_KEYS = (
     "input",
     "gt",
@@ -45,25 +37,12 @@ DISPLAY_KEYS = (
     "binary_wolf",
     "binary_nick",
     "binary_bradley",
-    "binary_gatos_like",
-    "binary_majority",
     "binary_readable",
-    "binary_readable_refined",
     "binary_wolf_fused",
 )
 DISPLAY_LABELS = {
     "binary_wolf_fused": "Ours (binary_wolf_fuse)",
 }
-ENSEMBLE_SOURCE_KEYS = (
-    "binary_fixed",
-    "binary_otsu",
-    "binary_sauvola",
-    "binary_niblack",
-    "binary_wolf",
-    "binary_nick",
-    "binary_bradley",
-    "binary_gatos_like",
-)
 
 
 @dataclass(frozen=True)
@@ -86,26 +65,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sauvola-window", type=int, default=35)
     parser.add_argument("--sauvola-k", type=float, default=0.2)
     parser.add_argument("--cleanup-kernel", type=int, default=3)
-    parser.add_argument("--classic-source", choices=("raw", "enhanced"), default="raw")
-    parser.add_argument("--local-window", type=int, default=35)
-    parser.add_argument("--niblack-k", type=float, default=-0.2)
-    parser.add_argument("--wolf-k", type=float, default=0.5)
-    parser.add_argument("--nick-k", type=float, default=-0.2)
-    parser.add_argument("--bradley-t", type=float, default=0.15)
-    parser.add_argument("--wolf-fused-weak-scale", type=float, default=1.05)
-    parser.add_argument("--wolf-fused-strong-scale", type=float, default=1.25)
-    parser.add_argument("--wolf-fused-weak-percentile", type=float, default=75.0)
-    parser.add_argument("--wolf-fused-strong-percentile", type=float, default=90.0)
-    parser.add_argument("--wolf-fused-min-area", type=int, default=2)
-    parser.add_argument("--gatos-window", type=int, default=35)
-    parser.add_argument("--gatos-sauvola-k", type=float, default=0.2)
-    parser.add_argument("--gatos-background-window", type=int, default=75)
-    parser.add_argument("--majority-min-votes", type=int, default=0)
-    parser.add_argument("--readable-refine-threshold-scale", type=float, default=1.14)
-    parser.add_argument("--readable-refine-percentile", type=float, default=45.0)
-    parser.add_argument("--readable-refine-min-area-ratio", type=float, default=0.42)
-    parser.add_argument("--readable-refine-hole-min-area-ratio", type=float, default=0.01)
-    parser.add_argument("--readable-refine-hole-max-area-ratio", type=float, default=0.55)
     parser.add_argument("--limit", type=int, default=0, help="Optional total case limit for smoke tests.")
     parser.add_argument("--skip-contact-sheets", action="store_true")
     parser.add_argument(
@@ -153,26 +112,8 @@ def main() -> None:
         print(f"[{index:02d}/{len(cases):02d}] {case.dataset} {case.track} {case.case_id}", flush=True)
         image = read_color(case.input_path)
         gt = read_gray(case.gt_path)
-        artifacts, pipeline_metrics = enhance_and_binarize(image, params)
-        artifacts.update(compute_classic_binarization_artifacts(image, artifacts["text_enhanced"], args))
-        artifacts["binary_wolf_fused"] = compute_wolf_fused_artifact(
-            image,
-            artifacts["background"],
-            artifacts["binary_wolf"],
-            artifacts["binary_nick"],
-            artifacts["binary_readable"],
-            pipeline_metrics,
-            args,
-        )
-        artifacts["binary_gatos_like"] = compute_gatos_like_artifact(image, args, params.cleanup_kernel)
-        artifacts["binary_majority"] = majority_ensemble(artifacts, args.majority_min_votes)
-        artifacts["binary_readable_refined"] = refine_readable_artifact(
-            image,
-            artifacts["background"],
-            artifacts["binary_readable"],
-            pipeline_metrics,
-            args,
-        )
+        processed_image, rectified_scale = resize_for_output(image)
+        artifacts, pipeline_metrics = process_rectified_document(processed_image, params)
 
         case_key = f"{case.dataset}_{case.track}_{case.case_id}"
         case_dir = artifacts_root / case_key
@@ -210,6 +151,7 @@ def main() -> None:
                 "gray_std_after_correction": pipeline_metrics.get("gray_std_after_correction", ""),
                 "readable_text_ratio": pipeline_metrics.get("readable_text_ratio", ""),
                 "readable_text_components": pipeline_metrics.get("readable_text_components", ""),
+                "rectified_scale": round(rectified_scale, 6),
             }
         )
 
@@ -234,6 +176,7 @@ def main() -> None:
 def write_run_config(path: Path, args: argparse.Namespace, params: ScanParams, case_count: int) -> None:
     config = {
         "case_count": case_count,
+        "pipeline_version": PROCESSING_PIPELINE_VERSION,
         "datasets": {
             "dibco2019": str(args.dibco2019),
             "hdibco2018": str(args.hdibco2018),
@@ -245,27 +188,6 @@ def write_run_config(path: Path, args: argparse.Namespace, params: ScanParams, c
             "cleanup_kernel": params.cleanup_kernel,
             "contact_cell_width": args.contact_cell_width,
             "contact_columns": normalized_contact_columns(args.contact_columns),
-            "classic_source": args.classic_source,
-            "local_window": normalized_odd(args.local_window, 3),
-            "niblack_k": args.niblack_k,
-            "wolf_k": args.wolf_k,
-            "wolf_fused_weak_scale": args.wolf_fused_weak_scale,
-            "wolf_fused_strong_scale": args.wolf_fused_strong_scale,
-            "wolf_fused_weak_percentile": args.wolf_fused_weak_percentile,
-            "wolf_fused_strong_percentile": args.wolf_fused_strong_percentile,
-            "wolf_fused_min_area": args.wolf_fused_min_area,
-            "nick_k": args.nick_k,
-            "bradley_t": args.bradley_t,
-            "gatos_window": normalized_odd(args.gatos_window, 3),
-            "gatos_sauvola_k": args.gatos_sauvola_k,
-            "gatos_background_window": normalized_odd(args.gatos_background_window, 3),
-            "majority_min_votes": normalized_majority_min_votes(args.majority_min_votes, len(ENSEMBLE_SOURCE_KEYS)),
-            "majority_sources": list(ENSEMBLE_SOURCE_KEYS),
-            "readable_refine_threshold_scale": args.readable_refine_threshold_scale,
-            "readable_refine_percentile": args.readable_refine_percentile,
-            "readable_refine_min_area_ratio": args.readable_refine_min_area_ratio,
-            "readable_refine_hole_min_area_ratio": args.readable_refine_hole_min_area_ratio,
-            "readable_refine_hole_max_area_ratio": args.readable_refine_hole_max_area_ratio,
         },
         "methods": list(METHOD_KEYS),
         "metrics": [
@@ -339,283 +261,10 @@ def save_case_artifacts(case_dir: Path, image: np.ndarray, gt: np.ndarray, artif
         "binary_wolf_fused": artifacts["binary_wolf_fused"],
         "binary_nick": artifacts["binary_nick"],
         "binary_bradley": artifacts["binary_bradley"],
-        "binary_gatos_like": artifacts["binary_gatos_like"],
-        "binary_majority": artifacts["binary_majority"],
-        "binary_readable_refined": artifacts["binary_readable_refined"],
     }
     for name, img in output_images.items():
         cv2.imwrite(str(case_dir / f"{name}.png"), img)
     return output_images
-
-
-def compute_classic_binarization_artifacts(
-    image: np.ndarray, text_enhanced: np.ndarray, args: argparse.Namespace
-) -> dict[str, np.ndarray]:
-    source = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if args.classic_source == "raw" else text_enhanced
-    window = normalized_odd(args.local_window, 3)
-    mean, std, mean_square = local_statistics(source, window)
-
-    return {
-        "binary_niblack": threshold_dark_foreground(source, niblack_threshold(mean, std, args.niblack_k)),
-        "binary_wolf": threshold_dark_foreground(source, wolf_threshold(source, mean, std, args.wolf_k)),
-        "binary_nick": threshold_dark_foreground(source, nick_threshold(mean, mean_square, args.nick_k)),
-        "binary_bradley": threshold_dark_foreground(source, bradley_threshold(mean, args.bradley_t)),
-    }
-
-
-def local_statistics(image: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    image_float = image.astype(np.float32)
-    mean = cv2.boxFilter(image_float, ddepth=-1, ksize=(window, window), normalize=True, borderType=cv2.BORDER_REPLICATE)
-    mean_square = cv2.boxFilter(
-        image_float * image_float,
-        ddepth=-1,
-        ksize=(window, window),
-        normalize=True,
-        borderType=cv2.BORDER_REPLICATE,
-    )
-    variance = np.maximum(mean_square - mean * mean, 0.0)
-    return mean, np.sqrt(variance), mean_square
-
-
-def niblack_threshold(mean: np.ndarray, std: np.ndarray, k: float) -> np.ndarray:
-    return mean + k * std
-
-
-def wolf_threshold(image: np.ndarray, mean: np.ndarray, std: np.ndarray, k: float) -> np.ndarray:
-    min_gray = float(np.min(image))
-    max_std = max(float(np.max(std)), 1.0)
-    return mean + k * ((std / max_std) - 1.0) * (mean - min_gray)
-
-
-def nick_threshold(mean: np.ndarray, mean_square: np.ndarray, k: float) -> np.ndarray:
-    return mean + k * np.sqrt(np.maximum(mean_square, 0.0))
-
-
-def bradley_threshold(mean: np.ndarray, t: float) -> np.ndarray:
-    return mean * (1.0 - t)
-
-
-def threshold_dark_foreground(image: np.ndarray, threshold: np.ndarray) -> np.ndarray:
-    return np.where(image.astype(np.float32) > threshold, 255, 0).astype(np.uint8)
-
-
-def compute_wolf_fused_artifact(
-    image: np.ndarray,
-    background: np.ndarray,
-    binary_wolf: np.ndarray,
-    binary_nick: np.ndarray,
-    binary_readable: np.ndarray,
-    pipeline_metrics: dict[str, float | int | str],
-    args: argparse.Namespace,
-) -> np.ndarray:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if background.shape != gray.shape:
-        background = cv2.resize(background, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_AREA)
-
-    relative_dark = relative_dark_detail(gray, background)
-    wolf_mask = to_foreground_mask(binary_wolf)
-    nick_mask = to_foreground_mask(binary_nick)
-    readable_mask = to_foreground_mask(binary_readable)
-    candidate_source = np.logical_or(nick_mask, readable_mask)
-
-    source_values = relative_dark[candidate_source]
-    weak_percentile = float(np.clip(args.wolf_fused_weak_percentile, 0.0, 100.0))
-    strong_percentile = float(np.clip(args.wolf_fused_strong_percentile, weak_percentile, 100.0))
-    weak_floor = float(np.percentile(source_values, weak_percentile)) if source_values.size else 6.0
-    strong_floor = float(np.percentile(source_values, strong_percentile)) if source_values.size else weak_floor
-    base_threshold = safe_float(pipeline_metrics.get("readable_text_threshold"), weak_floor)
-    weak_threshold = max(base_threshold * max(float(args.wolf_fused_weak_scale), 0.1), weak_floor)
-    strong_threshold = max(base_threshold * max(float(args.wolf_fused_strong_scale), 0.1), strong_floor, weak_threshold)
-
-    strong_seed = np.logical_or(wolf_mask, np.logical_and(candidate_source, relative_dark >= strong_threshold))
-    weak_candidate = np.logical_and(candidate_source, relative_dark >= weak_threshold)
-    candidate = np.logical_or(wolf_mask, weak_candidate)
-    fused = keep_components_touching_seed(candidate, strong_seed, max(int(args.wolf_fused_min_area), 1))
-    return np.where(fused, 0, 255).astype(np.uint8)
-
-
-def relative_dark_detail(gray: np.ndarray, background: np.ndarray) -> np.ndarray:
-    dark_detail = cv2.subtract(background, gray)
-    relative_dark = dark_detail.astype(np.float32) * 255.0 / np.maximum(background.astype(np.float32), 1.0)
-    relative_dark = cv2.GaussianBlur(np.clip(relative_dark, 0, 255).astype(np.uint8), (3, 3), 0)
-    return relative_dark.astype(np.float32)
-
-
-def keep_components_touching_seed(candidate: np.ndarray, seed: np.ndarray, min_area: int) -> np.ndarray:
-    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(candidate.astype(np.uint8), 8)
-    kept = np.zeros_like(candidate, dtype=bool)
-    for label in range(1, labels_count):
-        component = labels == label
-        if int(stats[label, cv2.CC_STAT_AREA]) < min_area:
-            continue
-        if np.any(np.logical_and(component, seed)):
-            kept[component] = True
-    return kept
-
-
-def compute_gatos_like_artifact(image: np.ndarray, args: argparse.Namespace, cleanup_kernel: int) -> np.ndarray:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    window = normalized_odd(args.gatos_window, 3)
-    mean, std, _ = local_statistics(gray, window)
-    initial_threshold = sauvola_threshold(mean, std, args.gatos_sauvola_k, r=128.0)
-    initial_foreground = gray.astype(np.float32) <= initial_threshold
-    initial_foreground = clean_foreground_mask(initial_foreground, 3)
-
-    background_window = normalized_odd(args.gatos_background_window, window)
-    background = estimate_background_from_mask(gray, ~initial_foreground, background_window)
-    corrected = cv2.divide(gray, background, scale=255)
-    corrected = percentile_stretch_uint8(corrected, 1.0, 99.0)
-    _, binary = cv2.threshold(corrected, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return cleanup_dark_foreground_binary(binary, cleanup_kernel)
-
-
-def sauvola_threshold(mean: np.ndarray, std: np.ndarray, k: float, r: float) -> np.ndarray:
-    return mean * (1.0 + k * ((std / max(r, 1.0)) - 1.0))
-
-
-def clean_foreground_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    cleaned = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel, iterations=1)
-    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return cleaned.astype(bool)
-
-
-def estimate_background_from_mask(gray: np.ndarray, background_mask: np.ndarray, window: int) -> np.ndarray:
-    gray_float = gray.astype(np.float32)
-    if int(background_mask.sum()) < max(32, int(gray.size * 0.05)):
-        background_mask = np.ones_like(background_mask, dtype=bool)
-
-    weights = background_mask.astype(np.float32)
-    values = gray_float * weights
-    blurred_values = cv2.GaussianBlur(values, (window, window), 0, borderType=cv2.BORDER_REPLICATE)
-    blurred_weights = cv2.GaussianBlur(weights, (window, window), 0, borderType=cv2.BORDER_REPLICATE)
-    smooth_gray = cv2.GaussianBlur(gray_float, (window, window), 0, borderType=cv2.BORDER_REPLICATE)
-
-    background = np.where(blurred_weights > 1e-3, blurred_values / np.maximum(blurred_weights, 1e-3), smooth_gray)
-    background = cv2.GaussianBlur(background, (window, window), 0, borderType=cv2.BORDER_REPLICATE)
-    return np.clip(background, 1, 255).astype(np.uint8)
-
-
-def percentile_stretch_uint8(image: np.ndarray, low_percentile: float, high_percentile: float) -> np.ndarray:
-    low, high = np.percentile(image, (low_percentile, high_percentile))
-    if float(high - low) < 4.0:
-        return np.clip(image, 0, 255).astype(np.uint8)
-    stretched = (image.astype(np.float32) - float(low)) * (255.0 / float(high - low))
-    return np.clip(stretched, 0, 255).astype(np.uint8)
-
-
-def cleanup_dark_foreground_binary(binary: np.ndarray, kernel_size: int) -> np.ndarray:
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    foreground = (binary < 128).astype(np.uint8)
-    foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, kernel, iterations=1)
-    foreground = cv2.morphologyEx(foreground, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return np.where(foreground > 0, 0, 255).astype(np.uint8)
-
-
-def majority_ensemble(artifacts: dict[str, np.ndarray], requested_min_votes: int) -> np.ndarray:
-    source_masks = [to_foreground_mask(artifacts[key]) for key in ENSEMBLE_SOURCE_KEYS if key in artifacts]
-    if not source_masks:
-        raise ValueError("No source masks available for majority ensemble.")
-    min_votes = normalized_majority_min_votes(requested_min_votes, len(source_masks))
-    votes = np.sum(np.stack(source_masks, axis=0), axis=0)
-    return np.where(votes >= min_votes, 0, 255).astype(np.uint8)
-
-
-def normalized_majority_min_votes(requested_min_votes: int, source_count: int) -> int:
-    if requested_min_votes > 0:
-        return min(max(int(requested_min_votes), 1), source_count)
-    return source_count // 2 + 1
-
-
-def refine_readable_artifact(
-    image: np.ndarray,
-    background: np.ndarray,
-    binary_readable: np.ndarray,
-    pipeline_metrics: dict[str, float | int | str],
-    args: argparse.Namespace,
-) -> np.ndarray:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if background.shape != gray.shape:
-        background = cv2.resize(background, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_AREA)
-
-    mask = to_foreground_mask(binary_readable)
-    if not np.any(mask):
-        return binary_readable.copy()
-
-    dark_detail = cv2.subtract(background, gray)
-    relative_dark = dark_detail.astype(np.float32) * 255.0 / np.maximum(background.astype(np.float32), 1.0)
-    relative_dark = np.clip(relative_dark, 0, 255)
-
-    foreground_values = relative_dark[mask]
-    trim_percentile = float(np.clip(args.readable_refine_percentile, 0.0, 100.0))
-    fallback_threshold = float(np.percentile(foreground_values, trim_percentile)) if foreground_values.size else 6.0
-    base_threshold = safe_float(pipeline_metrics.get("readable_text_threshold"), fallback_threshold)
-    threshold_scale = max(float(args.readable_refine_threshold_scale), 0.1)
-    min_area_ratio = float(np.clip(args.readable_refine_min_area_ratio, 0.05, 0.95))
-    hole_min_area_ratio = float(np.clip(args.readable_refine_hole_min_area_ratio, 0.0, 0.5))
-    hole_max_area_ratio = float(np.clip(args.readable_refine_hole_max_area_ratio, hole_min_area_ratio, 0.95))
-    boundary_threshold = max(base_threshold * threshold_scale, fallback_threshold)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
-    refined = np.zeros_like(mask, dtype=np.uint8)
-
-    for label in range(1, labels_count):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        component = labels == label
-        if area <= 6:
-            refined[component] = 1
-            continue
-
-        eroded = cv2.erode(component.astype(np.uint8), kernel, iterations=1).astype(bool)
-        boundary = np.logical_and(component, ~eroded)
-        weak_pixels = np.logical_and(component, relative_dark < boundary_threshold)
-        weak_boundary = np.logical_and(boundary, weak_pixels)
-        weak_holes = internal_weak_regions(weak_pixels, boundary, area, hole_min_area_ratio, hole_max_area_ratio)
-        weak_to_remove = np.logical_or(weak_boundary, weak_holes)
-        candidate = np.logical_and(component, ~weak_to_remove)
-
-        min_kept_area = max(2, int(round(area * min_area_ratio)))
-        if int(candidate.sum()) < min_kept_area:
-            refined[component] = 1
-        else:
-            refined[candidate] = 1
-
-    return np.where(refined > 0, 0, 255).astype(np.uint8)
-
-
-def internal_weak_regions(
-    weak_pixels: np.ndarray,
-    component_boundary: np.ndarray,
-    component_area: int,
-    min_area_ratio: float,
-    max_area_ratio: float,
-) -> np.ndarray:
-    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(weak_pixels.astype(np.uint8), 8)
-    holes = np.zeros_like(weak_pixels, dtype=bool)
-    min_area = max(2, int(round(component_area * min_area_ratio)))
-    max_area = max(min_area, int(round(component_area * max_area_ratio)))
-
-    for label in range(1, labels_count):
-        weak_region = labels == label
-        if np.any(np.logical_and(weak_region, component_boundary)):
-            continue
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if min_area <= area <= max_area:
-            holes[weak_region] = True
-    return holes
-
-
-def safe_float(value: object, fallback: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return fallback
-
-
-def normalized_odd(value: int, minimum: int) -> int:
-    value = max(int(value), minimum)
-    return value if value % 2 == 1 else value + 1
 
 
 def compute_binary_metrics(prediction: np.ndarray, ground_truth: np.ndarray) -> dict[str, float]:

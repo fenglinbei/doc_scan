@@ -49,25 +49,11 @@ python3 experiments/evaluate_dibco.py \
   --out runtime/experiments/dibco_eval_v1
 ```
 
-扩展经典局部阈值方法后的 v2 对比：
-
-```bash
-python3 experiments/evaluate_dibco.py \
-  --out runtime/experiments/dibco_eval_v2_methods
-```
-
-加入 Gatos-like 背景估计和 majority ensemble 后的完整 v3 对比：
-
-```bash
-python3 experiments/evaluate_dibco.py \
-  --out runtime/experiments/dibco_eval_v3_methods
-```
-
 如果只想先跑最终指标，不生成较大的 contact sheet：
 
 ```bash
 python3 experiments/evaluate_dibco.py \
-  --out runtime/experiments/dibco_eval_v3_methods \
+  --out runtime/experiments/dibco_eval_v26 \
   --skip-contact-sheets
 ```
 
@@ -79,7 +65,7 @@ python3 experiments/evaluate_dibco.py \
   --out runtime/experiments/dibco_eval_preview
 ```
 
-当前共有 12 个展示面板，默认布局为 `6 x 2`。如需自定义每行列数，可使用：
+当前共有 11 个展示面板，默认布局为 `6 x 2`。如需自定义每行列数，可使用：
 
 ```bash
 python3 experiments/evaluate_dibco.py \
@@ -92,7 +78,7 @@ python3 experiments/evaluate_dibco.py \
 ```bash
 python3 experiments/evaluate_dibco.py \
   --limit 3 \
-  --out runtime/experiments/dibco_eval_v3_examples
+  --out runtime/experiments/dibco_eval_v26_examples
 ```
 
 常用调参示例：
@@ -107,7 +93,7 @@ python3 experiments/evaluate_dibco.py \
 
 ## 3. 方法设置
 
-脚本复用后端当前增强函数 `enhance_and_binarize`，对每张图生成并评估以下方法：
+脚本先复用后端 `resize_for_output` 的矫正后图像尺寸限制，再调用统一接口 `process_rectified_document`，对每张图生成并评估后端同一套二值化产物。评测脚本不再复刻或追加另一套 Gatos、majority、refined 分支，避免与线上后端处理线分叉。
 
 | 方法 | 含义 |
 | --- | --- |
@@ -119,20 +105,9 @@ python3 experiments/evaluate_dibco.py \
 | `binary_wolf_fused` | Ours (`binary_wolf_fuse`)：以 Wolf/NICK 的细笔画作为强种子，结合相对暗细节图中的弱候选，只保留与强种子连通的低对比笔画。Contact sheet 中显示为 `Ours (binary_wolf_fuse)`。 |
 | `binary_nick` | NICK 局部阈值，默认作用于原始灰度图，窗口 `35`、`k=-0.2`。 |
 | `binary_bradley` | Bradley-Roth 积分图局部均值阈值，默认作用于原始灰度图，窗口 `35`、`t=0.15`。 |
-| `binary_gatos_like` | Gatos-style 近似实现：Sauvola 初始前景、背景估计、光照归一化、Otsu 二值化和小核清理。 |
-| `binary_majority` | 无监督 majority ensemble，默认对 fixed、Otsu、Sauvola、Niblack、Wolf、NICK、Bradley、Gatos-like 这 8 个专家做严格多数投票。 |
 | `binary_readable` | 当前项目的可读二值图，基于相对暗文字细节和连通域过滤。 |
-| `binary_readable_refined` | `binary_readable` 的笔画细化变体：保留高置信度笔画核心，剥离低置信度边界灰边，并尝试恢复连通域内部低置信白洞，用于缓解笔画偏粗和 `o/a/e` 等字符内孔被填满的问题。 |
 
 `final` 在当前应用中仍指向增强灰度图 `text_enhanced`，因此实验中不把 `final` 当二值化候选。
-
-新增经典局部阈值方法默认使用 `--classic-source raw`，即从原始灰度图直接二值化，作为文献常见传统基线。如果要比较“同一增强结果上的不同阈值公式”，可以改用：
-
-```bash
-python3 experiments/evaluate_dibco.py \
-  --classic-source enhanced \
-  --out runtime/experiments/dibco_eval_v2_enhanced_source
-```
 
 ## 4. 输出内容
 
@@ -155,9 +130,6 @@ runtime/experiments/dibco_eval_v1/
       binary_wolf_fused.png
       binary_nick.png
       binary_bradley.png
-      binary_gatos_like.png
-      binary_majority.png
-      binary_readable_refined.png
   contact_sheets/
     dibco2019_trackA_01_sheet.png
   tables/

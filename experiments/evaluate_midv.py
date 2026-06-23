@@ -15,20 +15,10 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = REPO_ROOT / "backend"
-EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
-for path in (BACKEND_ROOT, EXPERIMENTS_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.scanner import ScanParams, enhance_and_binarize, order_points, process_image  # noqa: E402
-from evaluate_dibco import (  # noqa: E402
-    METHOD_KEYS,
-    compute_classic_binarization_artifacts,
-    compute_gatos_like_artifact,
-    compute_wolf_fused_artifact,
-    majority_ensemble,
-    refine_readable_artifact,
-)
+from app.scanner import BINARIZATION_METHOD_KEYS, PROCESSING_PIPELINE_VERSION, ScanParams, order_points, process_image  # noqa: E402
 
 
 CONDITION_LABELS = {
@@ -47,9 +37,11 @@ ARTIFACT_KEYS = (
     "rectified",
     "text_enhanced",
     "binary_readable",
-    "binary_readable_refined",
+    "binary_fixed",
+    "binary_otsu",
+    "binary_sauvola",
+    "binary_wolf",
     "binary_wolf_fused",
-    "binary_majority",
 )
 
 
@@ -109,28 +101,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sauvola-k", type=float, default=0.2)
     parser.add_argument("--cleanup-kernel", type=int, default=3)
 
-    # Keep these defaults aligned with experiments/evaluate_dibco.py so MIDV artifact
-    # generation exercises the same latest binarization variants.
-    parser.add_argument("--classic-source", choices=("raw", "enhanced"), default="raw")
-    parser.add_argument("--local-window", type=int, default=35)
-    parser.add_argument("--niblack-k", type=float, default=-0.2)
-    parser.add_argument("--wolf-k", type=float, default=0.5)
-    parser.add_argument("--nick-k", type=float, default=-0.2)
-    parser.add_argument("--bradley-t", type=float, default=0.15)
-    parser.add_argument("--wolf-fused-weak-scale", type=float, default=1.05)
-    parser.add_argument("--wolf-fused-strong-scale", type=float, default=1.25)
-    parser.add_argument("--wolf-fused-weak-percentile", type=float, default=75.0)
-    parser.add_argument("--wolf-fused-strong-percentile", type=float, default=90.0)
-    parser.add_argument("--wolf-fused-min-area", type=int, default=2)
-    parser.add_argument("--gatos-window", type=int, default=35)
-    parser.add_argument("--gatos-sauvola-k", type=float, default=0.2)
-    parser.add_argument("--gatos-background-window", type=int, default=75)
-    parser.add_argument("--majority-min-votes", type=int, default=0)
-    parser.add_argument("--readable-refine-threshold-scale", type=float, default=1.14)
-    parser.add_argument("--readable-refine-percentile", type=float, default=45.0)
-    parser.add_argument("--readable-refine-min-area-ratio", type=float, default=0.42)
-    parser.add_argument("--readable-refine-hole-min-area-ratio", type=float, default=0.01)
-    parser.add_argument("--readable-refine-hole-max-area-ratio", type=float, default=0.55)
     return parser.parse_args()
 
 
@@ -170,7 +140,6 @@ def main() -> None:
         pred_quad = np.asarray(result.corners, dtype=np.float32)
         geometry_metrics = compute_geometry_metrics(pred_quad, gt_quad, image.shape)
 
-        latest_artifacts, latest_metrics = compute_latest_method_artifacts(result.artifacts["rectified"], params, args)
         row = {
             **case_metadata(case),
             **geometry_metrics,
@@ -183,17 +152,18 @@ def main() -> None:
             "text_background_contrast": result.metrics.get("text_background_contrast", ""),
             "readable_text_ratio": result.metrics.get("readable_text_ratio", ""),
             "readable_text_components": result.metrics.get("readable_text_components", ""),
-            "latest_readable_text_ratio": latest_metrics.get("readable_text_ratio", ""),
-            "latest_readable_text_components": latest_metrics.get("readable_text_components", ""),
+            "folded_corner_refinements": result.metrics.get("folded_corner_refinements", ""),
+            "candidate_paper_boundary_score": result.metrics.get("candidate_paper_boundary_score", ""),
+            "pipeline_version": result.metrics.get("pipeline_version", ""),
         }
         per_frame_rows.append(row)
 
-        for method in METHOD_KEYS:
+        for method in BINARIZATION_METHOD_KEYS:
             method_rows.append(
                 {
                     **case_metadata(case),
                     "method": method,
-                    **binary_diagnostics(latest_artifacts[method]),
+                    **binary_diagnostics(result.artifacts[method]),
                 }
             )
 
@@ -204,7 +174,7 @@ def main() -> None:
                 pred_quad,
                 gt_quad,
                 result.artifacts["rectified"],
-                latest_artifacts,
+                result.artifacts,
                 geometry_metrics,
                 args.contact_cell_width,
             )
@@ -396,32 +366,6 @@ def read_case_bytes(case: MidvCase, ref: str) -> bytes:
     return (case.source_path / ref).read_bytes()
 
 
-def compute_latest_method_artifacts(
-    rectified: np.ndarray, params: ScanParams, args: argparse.Namespace
-) -> tuple[dict[str, np.ndarray], dict[str, float | int | str]]:
-    artifacts, pipeline_metrics = enhance_and_binarize(rectified, params)
-    artifacts.update(compute_classic_binarization_artifacts(rectified, artifacts["text_enhanced"], args))
-    artifacts["binary_wolf_fused"] = compute_wolf_fused_artifact(
-        rectified,
-        artifacts["background"],
-        artifacts["binary_wolf"],
-        artifacts["binary_nick"],
-        artifacts["binary_readable"],
-        pipeline_metrics,
-        args,
-    )
-    artifacts["binary_gatos_like"] = compute_gatos_like_artifact(rectified, args, params.cleanup_kernel)
-    artifacts["binary_majority"] = majority_ensemble(artifacts, args.majority_min_votes)
-    artifacts["binary_readable_refined"] = refine_readable_artifact(
-        rectified,
-        artifacts["background"],
-        artifacts["binary_readable"],
-        pipeline_metrics,
-        args,
-    )
-    return artifacts, pipeline_metrics
-
-
 def compute_geometry_metrics(pred_quad: np.ndarray, gt_quad: np.ndarray, image_shape: tuple[int, ...]) -> dict[str, float | int]:
     pred = order_points(np.asarray(pred_quad, dtype=np.float32))
     gt = order_points(np.asarray(gt_quad, dtype=np.float32))
@@ -499,7 +443,7 @@ def save_case_artifacts(
     pred_quad: np.ndarray,
     gt_quad: np.ndarray,
     rectified: np.ndarray,
-    latest_artifacts: dict[str, np.ndarray],
+    artifacts: dict[str, np.ndarray],
     geometry_metrics: dict[str, float | int],
     contact_cell_width: int,
 ) -> None:
@@ -509,11 +453,13 @@ def save_case_artifacts(
         "original": image,
         "gt_pred_overlay": overlay,
         "rectified": rectified,
-        "text_enhanced": latest_artifacts["text_enhanced"],
-        "binary_readable": latest_artifacts["binary_readable"],
-        "binary_readable_refined": latest_artifacts["binary_readable_refined"],
-        "binary_wolf_fused": latest_artifacts["binary_wolf_fused"],
-        "binary_majority": latest_artifacts["binary_majority"],
+        "text_enhanced": artifacts["text_enhanced"],
+        "binary_readable": artifacts["binary_readable"],
+        "binary_fixed": artifacts["binary_fixed"],
+        "binary_otsu": artifacts["binary_otsu"],
+        "binary_sauvola": artifacts["binary_sauvola"],
+        "binary_wolf": artifacts["binary_wolf"],
+        "binary_wolf_fused": artifacts["binary_wolf_fused"],
     }
     for name, artifact in images.items():
         cv2.imwrite(str(case_dir / f"{name}.png"), artifact)
@@ -693,6 +639,7 @@ def safe_div(numerator: float, denominator: float) -> float:
 def write_run_config(path: Path, args: argparse.Namespace, params: ScanParams, cases: list[MidvCase]) -> None:
     config = {
         "case_count": len(cases),
+        "pipeline_version": PROCESSING_PIPELINE_VERSION,
         "datasets": {
             "midv500": str(args.midv500),
             "midv2019": str(args.midv2019),
@@ -705,26 +652,6 @@ def write_run_config(path: Path, args: argparse.Namespace, params: ScanParams, c
             "sauvola_k": params.sauvola_k,
             "cleanup_kernel": params.cleanup_kernel,
             "frames_per_video": args.frames_per_video,
-            "classic_source": args.classic_source,
-            "local_window": args.local_window,
-            "niblack_k": args.niblack_k,
-            "wolf_k": args.wolf_k,
-            "nick_k": args.nick_k,
-            "bradley_t": args.bradley_t,
-            "wolf_fused_weak_scale": args.wolf_fused_weak_scale,
-            "wolf_fused_strong_scale": args.wolf_fused_strong_scale,
-            "wolf_fused_weak_percentile": args.wolf_fused_weak_percentile,
-            "wolf_fused_strong_percentile": args.wolf_fused_strong_percentile,
-            "wolf_fused_min_area": args.wolf_fused_min_area,
-            "gatos_window": args.gatos_window,
-            "gatos_sauvola_k": args.gatos_sauvola_k,
-            "gatos_background_window": args.gatos_background_window,
-            "majority_min_votes": args.majority_min_votes,
-            "readable_refine_threshold_scale": args.readable_refine_threshold_scale,
-            "readable_refine_percentile": args.readable_refine_percentile,
-            "readable_refine_min_area_ratio": args.readable_refine_min_area_ratio,
-            "readable_refine_hole_min_area_ratio": args.readable_refine_hole_min_area_ratio,
-            "readable_refine_hole_max_area_ratio": args.readable_refine_hole_max_area_ratio,
         },
         "primary_metrics": [
             "polygon_iou",
@@ -735,7 +662,7 @@ def write_run_config(path: Path, args: argparse.Namespace, params: ScanParams, c
             "success_corner_2pct",
             "success_corner_5pct",
         ],
-        "method_artifact_keys": list(METHOD_KEYS),
+        "method_artifact_keys": list(BINARIZATION_METHOD_KEYS),
     }
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
